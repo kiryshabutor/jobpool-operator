@@ -114,14 +114,18 @@ func (d *JobDefaulter) Default(ctx context.Context, job *batchv1.Job) error {
 }
 
 // getPool returns the JobPool of the namespace, or nil if there is none.
-// The webhook is called only for namespaces labelled by the controller, so a
-// cache miss happens only right after the JobPool is created, while this replica's
-// cache lags behind; the API server is asked then.
+// The cache is trusted only when it has a live JobPool. Otherwise this replica's
+// cache may lag behind, and the API server is asked:
+//   - no JobPool in the cache: it may have been created a moment ago;
+//   - a JobPool being deleted: a new "default" may have replaced it already.
+//
+// Both happen only while a JobPool is created or deleted, so the extra read is rare.
 func (d *JobDefaulter) getPool(ctx context.Context, namespace string) (*schedulingv1alpha1.JobPool, error) {
 	key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
 	var pool schedulingv1alpha1.JobPool
 	err := d.Cache.Get(ctx, key, &pool)
-	if apierrors.IsNotFound(err) {
+	if apierrors.IsNotFound(err) || err == nil && !pool.DeletionTimestamp.IsZero() {
+		pool = schedulingv1alpha1.JobPool{}
 		err = d.APIReader.Get(ctx, key, &pool)
 	}
 	if apierrors.IsNotFound(err) {

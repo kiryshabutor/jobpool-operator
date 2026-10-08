@@ -78,7 +78,7 @@ func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if !controllerutil.ContainsFinalizer(&pool, schedulingv1alpha1.Finalizer) {
 		base := pool.DeepCopy()
 		controllerutil.AddFinalizer(&pool, schedulingv1alpha1.Finalizer)
-		if err := r.Patch(ctx, &pool, client.MergeFrom(base)); err != nil {
+		if err := r.Patch(ctx, &pool, finalizerPatch(base)); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
@@ -126,7 +126,14 @@ func (r *JobPoolReconciler) finalize(ctx context.Context, pool *schedulingv1alph
 
 	base := pool.DeepCopy()
 	controllerutil.RemoveFinalizer(pool, schedulingv1alpha1.Finalizer)
-	return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, pool, client.MergeFrom(base)))
+	return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, pool, finalizerPatch(base)))
+}
+
+// finalizerPatch patches metadata.finalizers with an optimistic lock. A merge patch
+// replaces the whole list, so without the lock a finalizer added by someone else
+// after our read would be lost; with it the patch fails and the reconcile retries.
+func finalizerPatch(base *schedulingv1alpha1.JobPool) client.Patch {
+	return client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
 }
 
 // cleanupNamespace handles a namespace without a JobPool that still has our traces:

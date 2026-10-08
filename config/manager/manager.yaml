@@ -78,6 +78,14 @@ spec:
           - --health-probe-bind-address=:8081
         image: controller:latest
         name: manager
+        # The webhook has failurePolicy: Fail. A deleted pod leaves the Service endpoints
+        # at once, but kube-proxy on the nodes needs a moment to update its rules; until
+        # then admission requests may still go to this pod. It keeps serving for 5 more
+        # seconds before SIGTERM, so a rolling update or drain does not reject Jobs.
+        lifecycle:
+          preStop:
+            sleep:
+              seconds: 5
         ports:
         - containerPort: 8081
           name: health

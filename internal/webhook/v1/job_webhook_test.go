@@ -127,6 +127,21 @@ func (emptyCache) List(context.Context, client.ObjectList, ...client.ListOption)
 	return nil
 }
 
+// staleCache still has the previous JobPool "default", being deleted: the cache of
+// this replica has not seen that it is gone and a new one has replaced it.
+type staleCache struct{ emptyCache }
+
+func (staleCache) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
+	*obj.(*schedulingv1alpha1.JobPool) = schedulingv1alpha1.JobPool{ObjectMeta: metav1.ObjectMeta{
+		Name:              key.Name,
+		Namespace:         key.Namespace,
+		UID:               "previous-pool",
+		DeletionTimestamp: new(metav1.Now()),
+		Finalizers:        []string{schedulingv1alpha1.Finalizer},
+	}}
+	return nil
+}
+
 var _ = Describe("Job Webhook", func() {
 	var (
 		namespace string
@@ -203,6 +218,15 @@ var _ = Describe("Job Webhook", func() {
 			expectQueued(job)
 		})
 
+		It("checks the API server when the cache has a JobPool being deleted", func() {
+			newPool(namespace)
+			defaulter.Cache = staleCache{}
+			job := newJob(namespace)
+
+			Expect(defaulter.Default(create, job)).To(Succeed())
+			expectQueued(job)
+		})
+
 		It("fails without an admission request", func() {
 			Expect(defaulter.Default(ctx, newJob(namespace))).NotTo(Succeed())
 		})
@@ -214,6 +238,16 @@ var _ = Describe("Job Webhook", func() {
 		})
 
 		It("puts a Job resumed by a user back into the queue", func() {
+			oldJob := suspended(newJob(namespace))
+			job := newJob(namespace)
+			job.Spec.Suspend = new(false)
+
+			Expect(defaulter.Default(request(admissionv1.Update, namespace, "user", oldJob), job)).To(Succeed())
+			expectQueued(job)
+		})
+
+		It("puts a resumed Job back into the queue when the cache has a JobPool being deleted", func() {
+			defaulter.Cache = staleCache{}
 			oldJob := suspended(newJob(namespace))
 			job := newJob(namespace)
 			job.Spec.Suspend = new(false)

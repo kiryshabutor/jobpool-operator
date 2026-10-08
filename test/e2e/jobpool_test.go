@@ -210,6 +210,7 @@ func jobPoolScenarios() {
 	It("blocks Job creation only in JobPool namespaces while the webhook is down", func() {
 		pooled := createNamespace("e2e-webhook-down")
 		createPool(pooled, 1)
+		paused := createJob(pooled, 1, true)
 		plain := createNamespace("e2e-webhook-down-plain")
 
 		scaleManager(0)
@@ -226,6 +227,13 @@ func jobPoolScenarios() {
 		_, err := tryCreateJob(pooled, 1, false)
 		Expect(err).To(MatchError(ContainSubstring("mjob.kiribu.dev")),
 			"a Job slipped past the queue while the webhook was down")
+
+		// matchConditions: only resuming a Job needs the webhook, other updates do not.
+		out, err := exec.Command("kubectl", "patch", "job", paused, "-n", pooled, "--type=merge",
+			"-p", `{"spec":{"suspend":false}}`).CombinedOutput()
+		Expect(err).To(HaveOccurred(), "a Job was resumed past the queue while the webhook was down")
+		Expect(string(out)).To(ContainSubstring("mjob.kiribu.dev"))
+		kubectl("label", "job", paused, "-n", pooled, "team=e2e")
 
 		_, err = tryCreateJob(plain, 1, false)
 		Expect(err).NotTo(HaveOccurred(), "a namespace without a JobPool must not depend on the webhook")
