@@ -1,10 +1,10 @@
-# E2E-гайд
+# E2E guide
 
-Ручная проверка оператора в kind-кластере, шаг за шагом, с ожидаемым выводом. Те же сценарии автоматически
-проверяет `make test-e2e` (см. [в конце](#автоматические-e2e-тесты)).
+A manual, step-by-step check of the operator in a kind cluster, with expected output. The same scenarios are checked
+automatically by `make test-e2e` (see [the end](#automated-e2e-tests)).
 
-Перед началом оператор должен быть установлен по [Quickstart](../README.md#quickstart). Все команды выполняются из
-каталога `jobpool-operator` ветки `jobpool-operator`.
+Before you start, install the operator following the [Quickstart](../README.md#quickstart). All commands run from the
+`jobpool-operator` directory of the `jobpool-operator` branch.
 
 ```sh
 kubectl -n jobpool-operator-system get pods,pdb
@@ -16,13 +16,13 @@ kubectl -n jobpool-operator-system get pods,pdb
 # poddisruptionbudget.policy/jobpool-operator-controller-manager   1               N/A               1
 ```
 
-Для удобства — колонки, по которым видна очередь:
+For convenience, columns that show the queue:
 
 ```sh
 COLS='NAME:.metadata.name,SUSPEND:.spec.suspend,QUEUED:.metadata.labels.jobpool\.kiribu\.dev/queued,ACTIVE:.status.active,DONE:.status.succeeded'
 ```
 
-## 1. Лимит и очередь
+## 1. Limit and queue
 
 ```sh
 kubectl create ns demo
@@ -30,8 +30,8 @@ kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml   # nam
 kubectl -n demo wait --for=condition=Ready jobpool/default
 ```
 
-`Ready=True` значит, что контроллер поставил label и подключил namespace к webhook-у. API server применяет label по
-своему кэшу Namespace, обычно сразу:
+`Ready=True` means the controller has set the label and connected the namespace to the webhook. The API server applies
+the label using its own Namespace cache, usually immediately:
 
 ```sh
 kubectl get ns demo --show-labels
@@ -39,7 +39,7 @@ kubectl get ns demo --show-labels
 # demo   Active   4s    jobpool.kiribu.dev/enabled=true,kubernetes.io/metadata.name=demo
 ```
 
-Создаём 5 Job, каждая спит 20 секунд:
+Create 5 Jobs, each sleeps 20 seconds:
 
 ```sh
 for i in 1 2 3 4 5; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
@@ -57,8 +57,8 @@ kubectl -n demo get jobs -o custom-columns="$COLS"
 # sleep-kp4jg   false     <none>   1        <none>
 ```
 
-Работают 2, ещё 3 на паузе с label `queued`. Смотрим, как очередь сдвигается (`kubectl -n demo get jobs -w`):
-когда Job завершается, следующая по времени создания стартует. Через ~70 секунд все 5 завершены:
+2 are running, 3 more are suspended with the `queued` label. Watch the queue move (`kubectl -n demo get jobs -w`):
+when a Job finishes, the next one by creation time starts. After ~70 seconds all 5 are done:
 
 ```sh
 kubectl -n demo get jp
@@ -73,10 +73,10 @@ kubectl -n demo events --for jobpool/default
 # 34s   Normal   Started   JobPool/default   Started Job sleep-jrf5f from queue
 ```
 
-Первые две Job тоже прошли через очередь: webhook ставит на паузу **все** новые Job, решение о запуске принимает
-только контроллер.
+The first two Jobs went through the queue too: the webhook suspends **every** new Job, and only the controller decides
+what starts.
 
-## 2. Namespace без `JobPool` не затрагивается
+## 2. A namespace without a `JobPool` is unaffected
 
 ```sh
 kubectl create ns plain
@@ -93,11 +93,12 @@ kubectl -n plain get jobs -o custom-columns="$COLS"
 # sleep-fp5w7   false     <none>   1        <none>
 ```
 
-Label `enabled` у namespace нет, поэтому API server webhook даже не вызывает. Все Job стартуют сразу.
+The namespace has no `enabled` label, so the API server does not even call the webhook. All Jobs start immediately.
 
-## 3. Второй `JobPool` в namespace отклоняется
+## 3. A second `JobPool` in a namespace is rejected
 
-`JobPool` может называться только `default`, а два объекта с одним именем в namespace не допускает API server:
+A `JobPool` can only be named `default`, and the API server does not allow two objects with the same name in a
+namespace:
 
 ```sh
 kubectl -n demo create -f config/samples/scheduling_v1alpha1_jobpool.yaml
@@ -116,11 +117,12 @@ EOF
 # per namespace is allowed
 ```
 
-`kubectl apply` того же файла с `name: default` не создаёт второй пул, а обновляет существующий: это тот же объект.
+`kubectl apply` of the same file with `name: default` does not create a second pool but updates the existing one: it
+is the same object.
 
-## 4. Пауза пользователя не трогается
+## 4. A user's suspend is left alone
 
-Job, которую пользователь сам создал на паузе, в очередь не попадает, и оператор её не запускает:
+A Job the user created suspended does not enter the queue, and the operator does not start it:
 
 ```sh
 kubectl -n demo create job paused --image=busybox:1.37 --dry-run=client -o yaml -- sleep 5 \
@@ -135,12 +137,12 @@ kubectl -n demo get jp
 # default   2     0        0        True    Active   2m
 ```
 
-Место свободно (`ACTIVE 0`), но Job остаётся на паузе: это пауза пользователя.
+A slot is free (`ACTIVE 0`), but the Job stays suspended: it is the user's suspend.
 
-## 5. Снять паузу в обход очереди нельзя
+## 5. Resuming past the queue is not possible
 
-Пользователь снимает паузу со своей Job. Webhook ставит её в очередь, и контроллер запускает её, как только есть
-место. Чтобы увидеть очередь, сначала займём оба места:
+The user resumes their own Job. The webhook puts it into the queue, and the controller starts it as soon as there is a
+slot. To see the queue, first take both slots:
 
 ```sh
 for i in 1 2; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
@@ -157,12 +159,12 @@ kubectl -n demo get jp
 # default   2     2        1        True    Active   3m
 ```
 
-Запрос прошёл без ошибки, но Job не стартовала сверх лимита: она в очереди. Через ~20 секунд, когда одна из Job
-завершится, `paused` запустится. Запускать Job из очереди может только сам оператор.
+The request succeeded without an error, but the Job did not start over the limit: it is queued. After ~20 seconds,
+when one of the Jobs finishes, `paused` starts. Only the operator itself may start queued Jobs.
 
-## 6. Отказ лидера
+## 6. Leader failure
 
-Реконсилит только одна реплика (лидер), webhook обслуживают обе. Убиваем лидера при непустой очереди:
+Only one replica (the leader) reconciles; both serve the webhook. Kill the leader while the queue is not empty:
 
 ```sh
 for i in 1 2 3 4; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
@@ -171,17 +173,17 @@ kubectl -n jobpool-operator-system get lease b4772dc6.kiribu.dev -o jsonpath='{.
 # jobpool-operator-controller-manager-6f5c7d6fc6-2j9hh_...
 kubectl -n jobpool-operator-system delete pod jobpool-operator-controller-manager-6f5c7d6fc6-2j9hh
 
-# в это время Job создаётся без ошибок: webhook отвечает вторая реплика
+# meanwhile Jobs are created without errors: the other replica answers the webhook
 kubectl -n demo create -f config/samples/job_sleep.yaml
 ```
 
-Через несколько секунд lease у другой реплики, а очередь продолжает двигаться: `kubectl -n demo get jp`.
+A few seconds later the lease belongs to the other replica, and the queue keeps moving: `kubectl -n demo get jp`.
 
-## 7. Удаление `JobPool` запускает всю очередь
+## 7. Deleting the `JobPool` starts the whole queue
 
 ```sh
 for i in 1 2 3; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
-kubectl -n demo get jobs -l jobpool.kiribu.dev/queued=true      # есть Job в очереди
+kubectl -n demo get jobs -l jobpool.kiribu.dev/queued=true      # there are queued Jobs
 
 kubectl -n demo delete jobpool default
 
@@ -193,73 +195,75 @@ kubectl get ns demo --show-labels
 # demo   Active   2m33s   kubernetes.io/metadata.name=demo
 ```
 
-Finalizer снял label с namespace и паузу со всех Job из очереди. Новые Job в `demo` теперь создаются без паузы.
+The finalizer removed the label from the namespace and resumed every queued Job. New Jobs in `demo` are now created
+unsuspended.
 
-## 8. Оператор недоступен: `failurePolicy: Fail`
+## 8. Operator unavailable: `failurePolicy: Fail`
 
 ```sh
 kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml
-kubectl -n demo wait --for=condition=Ready jobpool/default    # без этого webhook может быть ещё не подключён
+kubectl -n demo wait --for=condition=Ready jobpool/default    # without this the webhook may not be connected yet
 kubectl -n jobpool-operator-system scale deploy jobpool-operator-controller-manager --replicas=0
 kubectl -n jobpool-operator-system wait --for=delete pod -l control-plane=controller-manager --timeout=60s
 
-# namespace с JobPool: создание отклоняется (примерно через 5 с, это timeoutSeconds webhook-а)
+# namespace with a JobPool: creation is rejected (after about 5 s, the webhook's timeoutSeconds)
 kubectl -n demo create -f config/samples/job_sleep.yaml
 # Error from server (InternalError): error when creating "config/samples/job_sleep.yaml": Internal error occurred:
 # failed calling webhook "mjob.kiribu.dev": failed to call webhook: Post "https://jobpool-operator-webhook-service.
 # jobpool-operator-system.svc:443/mutate-batch-v1-job?timeout=5s": context deadline exceeded
 
-# namespace без JobPool: работает как обычно
+# namespace without a JobPool: works as usual
 kubectl -n plain create -f config/samples/job_sleep.yaml
 # job.batch/sleep-nbwbq created
 ```
 
-Без оператора Job нельзя ни поставить в очередь, ни безопасно пропустить: она стартовала бы сверх лимита. Поэтому
-создание отклоняется, но только в namespace, где админ включил лимит. Возвращаем оператор:
+Without the operator a Job can neither be queued nor safely admitted: it would start over the limit. So creation is
+rejected, but only in namespaces where the admin enabled the limit. Bring the operator back:
 
 ```sh
 kubectl -n jobpool-operator-system scale deploy jobpool-operator-controller-manager --replicas=2
 kubectl -n jobpool-operator-system rollout status deploy/jobpool-operator-controller-manager
 ```
 
-## Очистка
+## Cleanup
 
 ```sh
 kubectl delete ns demo plain
 ```
 
-## Автоматические e2e-тесты
+## Automated e2e tests
 
 ```sh
 make test-e2e
 ```
 
-Что делает:
+What it does:
 
-1. Создаёт отдельный kind-кластер `jobpool-operator-test-e2e` (имя меняется через `KIND_CLUSTER=...`), если его ещё
-   нет. Доступ к нему пишется в отдельный kubeconfig `bin/<кластер>.kubeconfig`, и все команды теста работают только
-   через него: текущий контекст в `~/.kube/config` не меняется и не используется.
-2. Собирает образ, загружает его в kind, ставит cert-manager и деплоит оператор.
-3. Запускает тесты из `test/e2e/` (~8 минут, Job реально выполняются):
-   - менеджер запущен (2 пода), метрики отдаются, cert-manager выпустил сертификат и подставил CA в webhook;
-   - лимит: пул `max=2`, 5 Job создаются одновременно — пик работающих ровно 2 (считается по `startTime` и
-     `completionTime` Job, а не опросом), все 5 завершаются;
-   - FIFO: Job запускаются (`status.startTime`) в порядке создания;
-   - namespace без `JobPool` — Job стартуют сразу, без label;
-   - второй `default` отклоняется (`AlreadyExists`), пул с другим именем — CEL-правилом;
-   - пауза пользователя держится 20 секунд, label не появляется;
-   - снятие паузы пользователем (с Job из очереди и со своей) — Job возвращаются в очередь, работает по-прежнему 1;
-   - удаление `JobPool` — очередь пуста, все Job запущены, label `enabled` снят;
-   - смена лидера при непустой очереди — новый лидер продолжает очередь, пик по-прежнему 1, Job создаются, пока
-     работает одна реплика;
-   - менеджер в `replicas=0` — Job в namespace с пулом отклоняется, снять паузу тоже нельзя, а `kubectl label job`
-     проходит (`matchConditions`); в namespace без пула Job создаётся.
-4. Удаляет кластер и его kubeconfig.
+1. Creates a dedicated kind cluster `jobpool-operator-test-e2e` (override with `KIND_CLUSTER=...`) unless it already
+   exists. Its credentials go to a separate kubeconfig `bin/<cluster>.kubeconfig`, and every test command uses only
+   that file: the current context in `~/.kube/config` is neither changed nor used.
+2. Builds the image, loads it into kind, installs cert-manager and deploys the operator.
+3. Runs the tests in `test/e2e/` (~8 minutes, the Jobs really run):
+   - the manager is running (2 pods), metrics are served, cert-manager issued the certificate and injected the CA into
+     the webhook;
+   - limit: pool `max=2`, 5 Jobs created concurrently; the peak of running Jobs is exactly 2 (computed from the Jobs'
+     `startTime` and `completionTime`, not by polling), all 5 complete;
+   - FIFO: Jobs start (`status.startTime`) in creation order;
+   - namespace without a `JobPool`: Jobs start immediately, without the label;
+   - a second `default` is rejected (`AlreadyExists`), a pool with another name by the CEL rule;
+   - a user's suspend holds for 20 seconds, the label does not appear;
+   - a user's resume (of a queued Job and of their own): the Jobs go back into the queue, still 1 running;
+   - deleting the `JobPool`: the queue is empty, all Jobs started, the `enabled` label removed;
+   - leader failover with a non-empty queue: the new leader continues the queue, the peak is still 1, Jobs can be
+     created while only one replica runs;
+   - manager at `replicas=0`: a Job in a namespace with a pool is rejected, resuming is rejected too, while
+     `kubectl label job` succeeds (`matchConditions`); in a namespace without a pool the Job is created.
+4. Deletes the cluster and its kubeconfig.
 
-После неудачного прогона кластер остаётся для разбора; удаляет его `make cleanup-test-e2e`.
+After a failed run the cluster is kept for debugging; `make cleanup-test-e2e` deletes it.
 
-Если kind не может поднять кластер при уже работающих других (`kubeadm init` падает с `connection refused`),
-поднимите лимиты inotify:
+If kind cannot bring up a cluster while others are running (`kubeadm init` fails with `connection refused`), raise the
+inotify limits:
 
 ```sh
 sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288

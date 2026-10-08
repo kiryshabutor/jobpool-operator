@@ -1,77 +1,78 @@
 # jobpool-operator
 
-Kubernetes-оператор, который ограничивает число **одновременно работающих Job** в namespace.
+A Kubernetes operator that limits the number of **concurrently running Jobs** in a namespace.
 
-Админ создаёт в namespace ресурс `JobPool` с именем `default` и полем `maxConcurrentJobs`. После этого каждая новая Job в этом namespace
-создаётся **на паузе** (`spec.suspend: true`) и встаёт в очередь. Контроллер снимает паузу с Job в порядке создания
-(FIFO), когда работающих меньше лимита. Клиенты создают Job как обычно и о лимите ничего не знают: Job не отклоняется,
-а выполнится, как только освободится место. Namespace без `JobPool` оператор не трогает.
+An admin creates a `JobPool` named `default` with a `maxConcurrentJobs` field in a namespace. From then on, every new
+Job in that namespace is created **suspended** (`spec.suspend: true`) and enters a queue. The controller resumes Jobs
+in creation order (FIFO) while fewer than the limit are running. Clients create Jobs as usual and know nothing about
+the limit: a Job is never rejected, it runs as soon as a slot frees up. Namespaces without a `JobPool` are untouched.
 
 ```
 kubectl create job ──► mutating webhook ──► etcd ──► controller ──► suspend: false
-                       (suspend: true +              (FIFO, не больше
+                       (suspend: true +              (FIFO, at most
                         label queued)                 maxConcurrentJobs)
 ```
 
-- **Mutating webhook** на Job: если в namespace есть `JobPool`, ставит `suspend: true` и label
-  `jobpool.kiribu.dev/queued=true` новой Job, а также Job, с которой паузу снимает кто-то кроме оператора.
-  Ничего не считает, решение о запуске принимает только контроллер.
-- **Один `JobPool` на namespace:** имя может быть только `default` (CEL-правило в CRD), а два объекта с одним
-  именем в namespace не допускает сам API server.
-- **Контроллер** считает работающие Job, запускает следующие из очереди и пишет счётчики в `status`.
-  При удалении `JobPool` finalizer запускает всю очередь.
+- **Mutating webhook** on Jobs: if the namespace has a `JobPool`, it sets `suspend: true` and the label
+  `jobpool.kiribu.dev/queued=true` on a new Job, and on a Job that someone other than the operator resumes.
+  It counts nothing; only the controller decides what starts.
+- **One `JobPool` per namespace:** the name can only be `default` (a CEL rule in the CRD), and the API server itself
+  does not allow two objects with the same name in a namespace.
+- **The controller** counts running Jobs, starts the next ones from the queue and writes counters to `status`.
+  When a `JobPool` is deleted, a finalizer starts the whole queue.
 
-Почему устроено именно так — в [docs/design.md](docs/design.md).
+Why it is built this way: [docs/design.md](docs/design.md).
 
 ## Quickstart
 
-### Требования
+### Requirements
 
 - Docker
 - [kind](https://kind.sigs.k8s.io/)
 - kubectl
-- Go 1.26+ (только для `make`-целей сборки и тестов)
+- Go 1.26+ (only for the `make` build and test targets)
 
-Версии:
+Versions:
 
-- **Проверено** (локально и в CI): kind v0.33.0, Kubernetes 1.37 (`kindest/node:v1.37.0`), cert-manager v1.21.1.
-- **Минимум для самого оператора** — Kubernetes 1.30: `matchConditions` у webhook и `preStop: sleep` (в 1.30–1.33
-  beta, включён по умолчанию). На других версиях подберите совместимый cert-manager по
-  [его таблице поддержки](https://cert-manager.io/docs/releases/); такие связки не проверялись.
+- **Tested** (locally and in CI): kind v0.33.0, Kubernetes 1.37 (`kindest/node:v1.37.0`), cert-manager v1.21.1.
+- **Minimum for the operator itself** is Kubernetes 1.30: webhook `matchConditions` and `preStop: sleep` (beta in
+  1.30–1.33, enabled by default). On other versions pick a compatible cert-manager from
+  [its support table](https://cert-manager.io/docs/releases/); such combinations were not tested.
 
-### Установка в kind
+### Install into kind
 
 ```sh
-# 0. Код: решение лежит в ветке jobpool-operator
+# 0. Code: the solution lives in the jobpool-operator branch
 git clone -b jobpool-operator https://github.com/kiryl-b-inno/inno-testtask.git
 cd inno-testtask/jobpool-operator
 
-# 1. Кластер
+# 1. Cluster
 kind create cluster --name jobpool
 
-# 2. cert-manager: выпускает TLS-сертификат для webhook-а
+# 2. cert-manager: issues the TLS certificate for the webhook
 kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml
 kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
 
-# 3. Образ оператора: собрать и загрузить в kind
+# 3. Operator image: build and load into kind
 make docker-build IMG=jobpool-operator:dev
 kind load docker-image jobpool-operator:dev --name jobpool
 
-# 4. CRD, RBAC, webhook и 2 реплики менеджера
+# 4. CRD, RBAC, webhook and 2 manager replicas
 make deploy IMG=jobpool-operator:dev
 kubectl -n jobpool-operator-system rollout status deploy/jobpool-operator-controller-manager
 ```
 
-Вместо шагов 3–4 можно поставить один собранный манифест: `make build-installer IMG=...` создаёт `dist/install.yaml`.
+Instead of steps 3–4 you can apply a single bundled manifest: `make build-installer IMG=...` produces
+`dist/install.yaml`.
 
-### Использование
+### Usage
 
 ```yaml
 # config/samples/scheduling_v1alpha1_jobpool.yaml
 apiVersion: scheduling.kiribu.dev/v1alpha1
 kind: JobPool
 metadata:
-  name: default            # единственное допустимое имя
+  name: default            # the only allowed name
 spec:
   maxConcurrentJobs: 2
 ```
@@ -79,94 +80,96 @@ spec:
 ```sh
 kubectl create ns demo
 kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml
-kubectl -n demo wait --for=condition=Ready jobpool/default   # контроллер подключил namespace к webhook-у
+kubectl -n demo wait --for=condition=Ready jobpool/default   # the controller connected the namespace to the webhook
 
-# 5 Job, каждая спит 20 секунд
+# 5 Jobs, each sleeps 20 seconds
 for i in 1 2 3 4 5; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
 
-kubectl -n demo get jobpool        # короткое имя: jp
+kubectl -n demo get jobpool        # short name: jp
 # NAME      MAX   ACTIVE   QUEUED   READY   REASON   AGE
 # default   2     2        3        True    Active   10s
 
-kubectl -n demo get jobs -w        # Job запускаются по 2
+kubectl -n demo get jobs -w        # Jobs run 2 at a time
 kubectl -n demo events --for jobpool/default
 ```
 
-Пошаговый сценарий со всеми случаями и ожидаемым выводом — в [docs/e2e-guide.md](docs/e2e-guide.md).
+A step-by-step walkthrough of all cases with expected output: [docs/e2e-guide.md](docs/e2e-guide.md).
 
-### Удаление
+### Uninstall
 
 ```sh
-kubectl delete jobpools --all -A   # сначала пулы: finalizer запустит их очереди
+kubectl delete jobpools --all -A   # pools first: the finalizer starts their queues
 make undeploy
 kind delete cluster --name jobpool
 ```
 
-Пулы нужно удалить **до** `make undeploy`, пока оператор работает. Иначе CRD не удалится: удаление будет ждать,
-пока с `JobPool` снимут finalizer, а снимать его будет некому.
+Delete the pools **before** `make undeploy`, while the operator is running. Otherwise the CRD will not go away: its
+deletion waits for the finalizer to be removed from each `JobPool`, and nobody is left to remove it.
 
-## Поведение и ограничения
+## Behaviour and limitations
 
-- **Очередь вместо отказа.** Job сверх лимита создаётся и ждёт на паузе, её не отклоняют.
-- **Работающие Job не останавливаются.** Если работающих Job уже больше лимита (например, их запустили до создания
-  `JobPool`), оператор их не трогает: пауза убила бы их поды. Он просто не запускает новые, пока работающих не станет
-  меньше лимита.
-- **Считаются все Job namespace,** в том числе созданные до `JobPool`. Завершённые (`Complete`/`Failed`) и стоящие на
-  паузе место не занимают.
-- **Лимит включается вместе с label на namespace.** `Ready=True` значит, что контроллер поставил label и подключил
-  namespace к webhook-у. API server применяет `namespaceSelector` по своему кэшу Namespace, который обновляется
-  асинхронно, обычно сразу; строгой границы этой задержки нет. Job, прошедшие до этого, считаются как Job,
-  запущенные до `JobPool`.
-- **Чужие паузы не трогаются.** Если пользователь сам создал Job с `suspend: true`, она не встаёт в очередь, и оператор
-  её не запускает, даже при удалении `JobPool`.
-- **Снять паузу в обход очереди нельзя.** Если пользователь снимает паузу (`suspend: false`) со своей Job или с Job из
-  очереди, webhook ставит её в очередь: Job запустится, когда освободится место. Запускать Job из очереди может
-  только сам оператор (его пользователь определяется при старте через `SelfSubjectReview`).
-- **Job от CronJob и других контроллеров тоже встают в очередь:** webhook не различает, кто создал Job.
-- **Один `JobPool` на namespace.** Имя только `default`: `JobPool` с другим именем отклоняет CEL-правило CRD, второй
-  `default` отклоняет API server (`AlreadyExists`). Новый `JobPool` нельзя создать и пока старый ещё удаляется.
-- **Удаление `JobPool` запускает всю очередь,** а label `jobpool.kiribu.dev/enabled` снимается с namespace. Job,
-  которая попала в очередь в момент удаления, контроллер тоже запустит: он следит за Job с label `queued` и в
-  namespace без `JobPool`.
-- **Label `jobpool.kiribu.dev/enabled` принадлежит контроллеру.** Если его изменить или снять вручную, контроллер
-  сразу вернёт его (или снимет, если `JobPool` в namespace нет).
-- **Если оператор недоступен, Job в подключённых namespace не создаются** (`failurePolicy: Fail`). Иначе Job прошла бы
-  без паузы и сразу стартовала, а поставить её на паузу потом нельзя без убийства подов: лимит был бы нарушен. Чтобы
-  это не задело остальной кластер, webhook вызывается только для namespace с label `jobpool.kiribu.dev/enabled=true`.
-  Этот label контроллер ставит сам, когда в namespace появляется `JobPool`. На UPDATE webhook вызывается только когда
-  с Job снимают паузу (`matchConditions`), остальные изменения Job от оператора не зависят. Риск недоступности
-  снижают 2 реплики менеджера (webhook обслуживают обе), PodDisruptionBudget, пауза `preStop` перед остановкой пода
-  и `timeoutSeconds: 5`.
-- **Лимит считает Job, а не поды.** Одна Job с большим `parallelism` может занять много ресурсов; ограничивать поды и
-  ресурсы — задача `ResourceQuota` и `LimitRange`, они работают вместе с `JobPool`.
-- **Leader election не даёт fencing.** Если старый лидер зависнет дольше срока lease (15 с) между планом и запуском,
-  а потом отправит запоздавшие запросы, лимит может быть превышен на размер его устаревшего плана, пока лишние Job не
-  завершатся. Это общее ограничение операторов на controller-runtime; подробнее в
-  [docs/design.md](docs/design.md#известные-ограничения).
-- **Оператор работает под своей учёткой.** Снимать паузу с Job из очереди может только пользователь, под которым
-  работает оператор (в кластере — его ServiceAccount). При `make run` это пользователь из kubeconfig.
+- **Queue instead of rejection.** A Job over the limit is created and waits suspended; it is not rejected.
+- **Running Jobs are never stopped.** If more Jobs are already running than the limit allows (for example, they were
+  started before the `JobPool` was created), the operator leaves them alone: suspending would kill their pods. It
+  simply starts nothing new until the running count drops below the limit.
+- **All Jobs in the namespace count,** including those created before the `JobPool`. Finished (`Complete`/`Failed`)
+  and suspended Jobs take no slot.
+- **The limit is enabled together with the namespace label.** `Ready=True` means the controller has set the label and
+  connected the namespace to the webhook. The API server applies `namespaceSelector` using its own Namespace cache,
+  which updates asynchronously, usually immediately; there is no strict bound on that delay. Jobs admitted before
+  that count as Jobs started before the `JobPool`.
+- **Other people's suspends are left alone.** If a user creates a Job with `suspend: true` themselves, it does not enter
+  the queue and the operator does not start it, not even when the `JobPool` is deleted.
+- **Resuming past the queue is not possible.** If a user resumes (`suspend: false`) their own Job or a queued Job, the
+  webhook puts it into the queue: the Job runs when a slot frees up. Only the operator itself may start queued Jobs
+  (its user is detected at startup via `SelfSubjectReview`).
+- **Jobs from CronJobs and other controllers are queued too:** the webhook does not care who created the Job.
+- **One `JobPool` per namespace.** The name must be `default`: a `JobPool` with another name is rejected by the CRD's
+  CEL rule, a second `default` by the API server (`AlreadyExists`). A new `JobPool` also cannot be created while the
+  old one is still being deleted.
+- **Deleting a `JobPool` starts the whole queue,** and the `jobpool.kiribu.dev/enabled` label is removed from the
+  namespace. A Job that entered the queue at the moment of deletion is started by the controller as well: it watches
+  Jobs with the `queued` label in namespaces without a `JobPool`.
+- **The `jobpool.kiribu.dev/enabled` label is owned by the controller.** If you change or remove it by hand, the
+  controller immediately restores it (or removes it if the namespace has no `JobPool`).
+- **If the operator is unavailable, Jobs cannot be created in connected namespaces** (`failurePolicy: Fail`).
+  Otherwise the Job would be admitted unsuspended and start right away, and it cannot be suspended later without
+  killing its pods: the limit would be broken. To keep the rest of the cluster unaffected, the webhook is called only
+  for namespaces labelled `jobpool.kiribu.dev/enabled=true`. The controller sets this label itself when a `JobPool`
+  appears in the namespace. On UPDATE the webhook is called only when a Job is being resumed (`matchConditions`); all
+  other Job changes do not depend on the operator. The risk of unavailability is reduced by 2 manager replicas (both
+  serve the webhook), a PodDisruptionBudget, a `preStop` pause before the pod stops, and `timeoutSeconds: 5`.
+- **The limit counts Jobs, not pods.** One Job with a large `parallelism` can use a lot of resources; limiting pods and
+  resources is the job of `ResourceQuota` and `LimitRange`, which work alongside `JobPool`.
+- **Leader election provides no fencing.** If an old leader stalls longer than the lease duration (15 s) between
+  planning and starting, and then sends its late requests, the limit can be exceeded by the size of its stale plan
+  until the extra Jobs finish. This is a general limitation of controller-runtime operators; see
+  [docs/design.md](docs/design.md#known-limitations).
+- **The operator runs under its own identity.** Only the user the operator runs as (in-cluster, its ServiceAccount)
+  can resume queued Jobs. With `make run` that is the user from your kubeconfig.
 
-## Разработка
+## Development
 
 ```sh
-make test       # unit + envtest (контроллер и webhook)
+make test       # unit + envtest (controller and webhook)
 make lint       # golangci-lint
-make test-e2e   # отдельный kind-кластер со своим kubeconfig, деплой, сценарии из docs/e2e-guide.md (~8 мин)
+make test-e2e   # dedicated kind cluster with its own kubeconfig, deploy, scenarios from docs/e2e-guide.md (~8 min)
 ```
 
-`make deploy` и `make test-e2e` записывают тег образа в `config/manager/kustomization.yaml`; это изменение не коммитим.
+`make deploy` and `make test-e2e` write the image tag into `config/manager/kustomization.yaml`; do not commit that
+change.
 
-## Структура
+## Layout
 
-| Путь | Что там |
+| Path | Contents |
 |---|---|
-| `api/v1alpha1/` | Тип `JobPool` с CEL-правилом имени, имена label, finalizer и condition |
-| `internal/jobpool/` | Чистая логика без Kubernetes-клиента: что активно, FIFO, план запуска, снятие паузы |
-| `internal/webhook/v1/` | Mutating webhook для Job |
-| `internal/controller/` | Reconcile, finalizer, очистка namespace без `JobPool`, watch-и |
-| `config/` | Kustomize-манифесты: CRD, RBAC, webhook, cert-manager, Deployment, PDB, samples |
-| `test/e2e/` | E2E-тесты на kind |
-| `docs/` | Дизайн и ручной e2e-гайд |
+| `api/v1alpha1/` | The `JobPool` type with the name CEL rule; label, finalizer and condition names |
+| `internal/jobpool/` | Pure logic without a Kubernetes client: what is active, FIFO, start plan, resume detection |
+| `internal/webhook/v1/` | Mutating webhook for Jobs |
+| `internal/controller/` | Reconcile, finalizer, cleanup of namespaces without a `JobPool`, watches |
+| `config/` | Kustomize manifests: CRD, RBAC, webhook, cert-manager, Deployment, PDB, samples |
+| `test/e2e/` | E2E tests on kind |
+| `docs/` | Design and the manual e2e guide |
 
 ## License
 
