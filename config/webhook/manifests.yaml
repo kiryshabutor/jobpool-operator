@@ -38,7 +38,7 @@ webhooks:
       namespace: system
       path: /validate-scheduling-kiribu-dev-v1alpha1-jobpool
   failurePolicy: Fail
-  name: vjobpool-v1alpha1.kb.io
+  name: vjobpool.kiribu.dev
   rules:
   - apiGroups:
     - scheduling.kiribu.dev
@@ -46,7 +46,6 @@ webhooks:
     - v1alpha1
     operations:
     - CREATE
-    - UPDATE
     resources:
     - jobpools
   sideEffects: None

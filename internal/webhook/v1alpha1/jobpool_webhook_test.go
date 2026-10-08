@@ -20,51 +20,73 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
-	// TODO (user): Add any additional imports if needed
 )
 
+func newNamespace() string {
+	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "jobpool-webhook-"}}
+	Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+	return ns.Name
+}
+
+func newPool(namespace, name string) *schedulingv1alpha1.JobPool {
+	return &schedulingv1alpha1.JobPool{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       schedulingv1alpha1.JobPoolSpec{MaxConcurrentJobs: 1},
+	}
+}
+
+// These tests create JobPools through the API server, so the request goes through
+// the real admission chain and the webhook served by the test manager.
 var _ = Describe("JobPool Webhook", func() {
-	var (
-		obj       *schedulingv1alpha1.JobPool
-		oldObj    *schedulingv1alpha1.JobPool
-		validator JobPoolValidator
-	)
+	var namespace string
 
 	BeforeEach(func() {
-		obj = &schedulingv1alpha1.JobPool{}
-		oldObj = &schedulingv1alpha1.JobPool{}
-		validator = JobPoolValidator{}
-		Expect(validator).NotTo(BeNil(), "Expected validator to be initialized")
-		Expect(oldObj).NotTo(BeNil(), "Expected oldObj to be initialized")
-		Expect(obj).NotTo(BeNil(), "Expected obj to be initialized")
+		namespace = newNamespace()
 	})
 
-	AfterEach(func() {
-		// TODO (user): Add any teardown logic common to all tests
+	It("allows the first JobPool in a namespace", func() {
+		Expect(k8sClient.Create(ctx, newPool(namespace, "first"))).To(Succeed())
 	})
 
-	Context("When creating or updating JobPool under Validating Webhook", func() {
-		// TODO (user): Add logic for validating webhooks
-		// Example:
-		// It("Should deny creation if a required field is missing", func() {
-		//     By("simulating an invalid creation scenario")
-		//     obj.SomeRequiredField = ""
-		//     Expect(validator.ValidateCreate(ctx, obj)).Error().To(HaveOccurred())
-		// })
-		//
-		// It("Should admit creation if all required fields are present", func() {
-		//     By("simulating an invalid creation scenario")
-		//     obj.SomeRequiredField = "valid_value"
-		//     Expect(validator.ValidateCreate(ctx, obj)).To(BeNil())
-		// })
-		//
-		// It("Should validate updates correctly", func() {
-		//     By("simulating a valid update scenario")
-		//     oldObj.SomeRequiredField = "updated_value"
-		//     obj.SomeRequiredField = "updated_value"
-		//     Expect(validator.ValidateUpdate(ctx, oldObj, obj)).To(BeNil())
-		// })
+	It("rejects a second JobPool in the same namespace", func() {
+		Expect(k8sClient.Create(ctx, newPool(namespace, "first"))).To(Succeed())
+
+		err := k8sClient.Create(ctx, newPool(namespace, "second"))
+
+		Expect(err).To(MatchError(ContainSubstring(
+			`JobPool "first" already exists in namespace "` + namespace + `"; only one JobPool per namespace is allowed`)))
 	})
 
+	It("allows JobPools in different namespaces", func() {
+		Expect(k8sClient.Create(ctx, newPool(namespace, "pool"))).To(Succeed())
+		Expect(k8sClient.Create(ctx, newPool(newNamespace(), "pool"))).To(Succeed())
+	})
+
+	It("allows a new JobPool while the old one is being deleted", func() {
+		old := newPool(namespace, "old")
+		// A finalizer keeps the deleted JobPool around with a deletionTimestamp.
+		controllerutil.AddFinalizer(old, schedulingv1alpha1.Finalizer)
+		Expect(k8sClient.Create(ctx, old)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, old)).To(Succeed())
+		DeferCleanup(func() {
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(old), old)).To(Succeed())
+			controllerutil.RemoveFinalizer(old, schedulingv1alpha1.Finalizer)
+			Expect(k8sClient.Update(ctx, old)).To(Succeed())
+		})
+
+		Expect(k8sClient.Create(ctx, newPool(namespace, "new"))).To(Succeed())
+	})
+
+	It("does not validate updates and deletion", func() {
+		pool := newPool(namespace, "pool")
+		validator := JobPoolValidator{}
+		Expect(validator.ValidateUpdate(ctx, pool, pool)).Error().NotTo(HaveOccurred())
+		Expect(validator.ValidateDelete(ctx, pool)).Error().NotTo(HaveOccurred())
+	})
 })
