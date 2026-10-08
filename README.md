@@ -65,6 +65,17 @@ kubectl -n jobpool-operator-system rollout status deploy/jobpool-operator-contro
 Instead of steps 3–4 you can apply a single bundled manifest: `make build-installer IMG=...` produces
 `dist/install.yaml`.
 
+Steps 1–4 in one go:
+
+```sh
+# kind needs higher inotify limits, otherwise kube-proxy crashes with "too many open files"
+# (the defaults come back after a reboot)
+sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+
+hack/demo-up.sh                  # recreates the jobpool cluster and deploys the operator from the current code
+KEEP_CLUSTER=1 hack/demo-up.sh   # keeps the cluster, only rebuilds and redeploys the operator
+```
+
 ### Usage
 
 ```yaml

@@ -3,7 +3,8 @@
 A manual, step-by-step check of the operator in a kind cluster, with expected output. The same scenarios are checked
 automatically by `make test-e2e` (see [the end](#automated-e2e-tests)).
 
-Before you start, install the operator following the [Quickstart](../README.md#quickstart). All commands run from the
+Before you start, install the operator following the [Quickstart](../README.md#quickstart) or with
+`hack/demo-up.sh`. All commands run from the
 `jobpool-operator` directory of the `jobpool-operator` branch.
 
 ```sh
