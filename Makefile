@@ -70,9 +70,13 @@ test: manifests generate fmt vet setup-envtest ## Run tests.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
 KIND_CLUSTER ?= jobpool-operator-test-e2e
+# The e2e tests talk to the Kind cluster through their own kubeconfig, never through
+# the current context of ~/.kube/config: a leftover test cluster must not make the
+# tests deploy to (and clean up) some other cluster.
+E2E_KUBECONFIG ?= $(LOCALBIN)/$(KIND_CLUSTER).kubeconfig
 
 .PHONY: setup-test-e2e
-setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
+setup-test-e2e: $(LOCALBIN) ## Set up a Kind cluster for e2e tests if it does not exist
 	@command -v $(KIND) >/dev/null 2>&1 || { \
 		echo "Kind is not installed. Please install Kind manually."; \
 		exit 1; \
@@ -82,17 +86,19 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			echo "Kind cluster '$(KIND_CLUSTER)' already exists. Skipping creation." ;; \
 		*) \
 			echo "Creating Kind cluster '$(KIND_CLUSTER)'..."; \
-			$(KIND) create cluster --name $(KIND_CLUSTER) ;; \
+			$(KIND) create cluster --name $(KIND_CLUSTER) --kubeconfig "$(E2E_KUBECONFIG)" ;; \
 	esac
+	@$(KIND) get kubeconfig --name $(KIND_CLUSTER) > "$(E2E_KUBECONFIG)"
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e -timeout=30m ./test/e2e/ -v -ginkgo.v
+	KUBECONFIG="$(E2E_KUBECONFIG)" KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e -timeout=30m ./test/e2e/ -v -ginkgo.v
 	$(MAKE) cleanup-test-e2e
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
-	@$(KIND) delete cluster --name $(KIND_CLUSTER)
+	@$(KIND) delete cluster --name $(KIND_CLUSTER) --kubeconfig "$(E2E_KUBECONFIG)"
+	@rm -f "$(E2E_KUBECONFIG)"
 
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
