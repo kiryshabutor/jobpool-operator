@@ -24,7 +24,6 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 )
@@ -61,19 +60,31 @@ func IsQueued(job *batchv1.Job) bool {
 		job.DeletionTimestamp == nil
 }
 
-// olderFirst orders objects by creationTimestamp and then by name.
-// creationTimestamp has a one-second resolution, so the name breaks ties
-// and keeps the order stable between reconciles.
-func olderFirst(a, b metav1.Object) int {
-	if c := a.GetCreationTimestamp().Compare(b.GetCreationTimestamp().Time); c != 0 {
-		return c
-	}
-	return cmp.Compare(a.GetName(), b.GetName())
+// IsResumed reports whether an update resumes the Job: spec.suspend changes from
+// true to false. A finished Job does not run again, so resuming it does not count.
+func IsResumed(oldJob, newJob *batchv1.Job) bool {
+	return IsSuspended(oldJob) && !IsSuspended(newJob) && !IsFinished(oldJob)
 }
 
-// SortFIFO sorts Jobs from the oldest to the newest.
+// Enqueue puts the Job into the operator's queue: spec.suspend=true and QueuedLabel.
+func Enqueue(job *batchv1.Job) {
+	job.Spec.Suspend = new(true)
+	if job.Labels == nil {
+		job.Labels = map[string]string{}
+	}
+	job.Labels[schedulingv1alpha1.QueuedLabel] = schedulingv1alpha1.LabelTrue
+}
+
+// SortFIFO sorts Jobs from the oldest to the newest: by creationTimestamp and then
+// by name. creationTimestamp has a one-second resolution, so the name breaks ties
+// and keeps the order stable between reconciles.
 func SortFIFO(jobs []*batchv1.Job) {
-	slices.SortFunc(jobs, func(a, b *batchv1.Job) int { return olderFirst(a, b) })
+	slices.SortFunc(jobs, func(a, b *batchv1.Job) int {
+		if c := a.CreationTimestamp.Compare(b.CreationTimestamp.Time); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Name, b.Name)
+	})
 }
 
 // QueuePlan is the decision of a single reconcile.

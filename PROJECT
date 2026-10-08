@@ -18,9 +18,6 @@ resources:
   kind: JobPool
   path: github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1
   version: v1alpha1
-  webhooks:
-    validation: true
-    webhookVersion: v1
 - core: true
   group: batch
   kind: Job

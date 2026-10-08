@@ -19,11 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
-	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -38,10 +38,6 @@ import (
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 	"github.com/kiryl-b-inno/jobpool-operator/internal/jobpool"
 )
-
-// releaseRecheckDelay is how long the finalizer waits before checking the queue
-// again when a Job was queued while the queue was being released.
-const releaseRecheckDelay = time.Second
 
 // JobPoolReconciler starts queued Jobs of a namespace without exceeding
 // spec.maxConcurrentJobs and releases the queue when the JobPool is deleted.
@@ -64,12 +60,15 @@ type JobPoolReconciler struct {
 
 // Reconcile recomputes the queue of the namespace from scratch on every call,
 // so it does not matter which event triggered it (level-triggered).
+// The only allowed JobPool name is "default", so every request is <namespace>/default.
 func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
 	var pool schedulingv1alpha1.JobPool
-	if err := r.Get(ctx, req.NamespacedName, &pool); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+	if err := r.Get(ctx, req.NamespacedName, &pool); apierrors.IsNotFound(err) {
+		return ctrl.Result{}, r.cleanupNamespace(ctx, req.Namespace)
+	} else if err != nil {
+		return ctrl.Result{}, err
 	}
 
 	if !pool.DeletionTimestamp.IsZero() {
@@ -82,20 +81,6 @@ func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Patch(ctx, &pool, client.MergeFrom(base)); err != nil {
 			return ctrl.Result{}, err
 		}
-	}
-
-	var pools schedulingv1alpha1.JobPoolList
-	if err := r.List(ctx, &pools, client.InNamespace(pool.Namespace)); err != nil {
-		return ctrl.Result{}, err
-	}
-	if primary := jobpool.Primary(pools.Items); primary == nil || primary.Name != pool.Name {
-		// Safety net for duplicates that slipped past the validating webhook.
-		// No requeue: deleting the primary triggers a reconcile of this pool (see SetupWithManager).
-		msg := "Namespace is already managed by another JobPool"
-		if primary != nil {
-			msg = fmt.Sprintf("Namespace is already managed by JobPool %q", primary.Name)
-		}
-		return ctrl.Result{}, r.updateStatus(ctx, &pool, 0, 0, metav1.ConditionFalse, schedulingv1alpha1.ReasonDuplicate, msg)
 	}
 
 	if err := r.setNamespaceLabel(ctx, pool.Namespace, true); err != nil {
@@ -124,9 +109,9 @@ func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 }
 
 // finalize releases the queue of a deleted JobPool and removes its finalizer.
-// If another JobPool remains in the namespace, it takes over the queue as is.
+// No new JobPool can appear meanwhile: it would have the same name as the one
+// being deleted, and the API server rejects it until the finalizer is gone.
 func (r *JobPoolReconciler) finalize(ctx context.Context, pool *schedulingv1alpha1.JobPool) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
 	if !controllerutil.ContainsFinalizer(pool, schedulingv1alpha1.Finalizer) {
 		return ctrl.Result{}, nil
 	}
@@ -135,29 +120,8 @@ func (r *JobPoolReconciler) finalize(ctx context.Context, pool *schedulingv1alph
 		metav1.ConditionFalse, schedulingv1alpha1.ReasonTerminating, "JobPool is being deleted"); err != nil {
 		return ctrl.Result{}, err
 	}
-
-	// Read pools from the API server: a pool created a moment ago must take over the queue.
-	var pools schedulingv1alpha1.JobPoolList
-	if err := r.APIReader.List(ctx, &pools, client.InNamespace(pool.Namespace)); err != nil {
+	if err := r.releaseNamespace(ctx, pool, pool.Namespace); err != nil {
 		return ctrl.Result{}, err
-	}
-
-	if successor := jobpool.Primary(pools.Items); successor != nil {
-		log.Info("Queue is handed over to another JobPool", "successor", successor.Name)
-	} else {
-		// Stop the webhook first, so no new Jobs are queued while the queue is released.
-		if err := r.setNamespaceLabel(ctx, pool.Namespace, false); err != nil {
-			return ctrl.Result{}, err
-		}
-		released, err := r.releaseQueue(ctx, pool)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if released > 0 {
-			// A Job may have been queued by a webhook that had not seen the deletion yet.
-			// Check the queue again before letting the JobPool go.
-			return ctrl.Result{RequeueAfter: releaseRecheckDelay}, nil
-		}
 	}
 
 	base := pool.DeepCopy()
@@ -165,25 +129,50 @@ func (r *JobPoolReconciler) finalize(ctx context.Context, pool *schedulingv1alph
 	return ctrl.Result{}, client.IgnoreNotFound(r.Patch(ctx, pool, client.MergeFrom(base)))
 }
 
-// releaseQueue starts every Job queued by the operator in the namespace and
-// returns how many Jobs it touched. Jobs suspended by the user have no queued
-// label and stay suspended.
-func (r *JobPoolReconciler) releaseQueue(ctx context.Context, pool *schedulingv1alpha1.JobPool) (int, error) {
+// cleanupNamespace handles a namespace without a JobPool that still has our traces:
+// the enabled label, or queued Jobs. A Job can be queued after the finalizer has
+// released the queue: its admission request passed the webhook while the JobPool
+// still existed, and was stored later. Such a Job triggers a reconcile (see
+// SetupWithManager) and is started here.
+func (r *JobPoolReconciler) cleanupNamespace(ctx context.Context, namespace string) error {
+	// The cache may lag behind a JobPool created a moment ago. Its own create event
+	// will reconcile the namespace, so there is nothing to clean up.
+	var pool schedulingv1alpha1.JobPool
+	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}, &pool)
+	if err == nil {
+		return nil
+	}
+	if !apierrors.IsNotFound(err) {
+		return err
+	}
+	return r.releaseNamespace(ctx, nil, namespace)
+}
+
+// releaseNamespace detaches the namespace from the webhook and starts every queued Job.
+// The label goes first, so no new Jobs are queued while the queue is released.
+// pool is the JobPool being deleted, used for events; nil if it is already gone.
+func (r *JobPoolReconciler) releaseNamespace(ctx context.Context, pool *schedulingv1alpha1.JobPool, namespace string) error {
+	if err := r.setNamespaceLabel(ctx, namespace, false); err != nil {
+		return err
+	}
+
 	var jobs batchv1.JobList
-	if err := r.APIReader.List(ctx, &jobs, client.InNamespace(pool.Namespace),
+	if err := r.APIReader.List(ctx, &jobs, client.InNamespace(namespace),
 		client.MatchingLabels{schedulingv1alpha1.QueuedLabel: schedulingv1alpha1.LabelTrue}); err != nil {
-		return 0, err
+		return err
 	}
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
 		if err := r.startJob(ctx, job); err != nil {
-			return 0, err
+			return err
 		}
 		logf.FromContext(ctx).Info("Released Job from queue", "job", job.Name)
-		r.Recorder.Eventf(pool, job, corev1.EventTypeNormal, "Released", "ReleaseJob",
-			"Released Job %s from queue: JobPool is being deleted", job.Name)
+		if pool != nil {
+			r.Recorder.Eventf(pool, job, corev1.EventTypeNormal, "Released", "ReleaseJob",
+				"Released Job %s from queue: JobPool is being deleted", job.Name)
+		}
 	}
-	return len(jobs.Items), nil
+	return nil
 }
 
 // startJob resumes a queued Job: spec.suspend=false and no queued label.
@@ -205,8 +194,8 @@ func (r *JobPoolReconciler) setNamespaceLabel(ctx context.Context, name string, 
 	if err := r.Get(ctx, client.ObjectKey{Name: name}, &ns); err != nil {
 		return client.IgnoreNotFound(err)
 	}
-	_, has := ns.Labels[schedulingv1alpha1.EnabledNamespaceLabel]
-	if has == enabled {
+	value, has := ns.Labels[schedulingv1alpha1.EnabledNamespaceLabel]
+	if enabled && value == schedulingv1alpha1.LabelTrue || !enabled && !has {
 		return nil
 	}
 	base := ns.DeepCopy()
@@ -252,24 +241,40 @@ func (r *JobPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&schedulingv1alpha1.JobPool{}).
 		// Any Job change (created, finished, deleted, user suspend) may free or take a slot.
-		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.poolsInNamespace)).
-		// When a JobPool goes away, a duplicate in the same namespace becomes primary.
-		Watches(&schedulingv1alpha1.JobPool{}, handler.EnqueueRequestsFromMapFunc(r.poolsInNamespace)).
+		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.jobToPool)).
+		// The enabled label belongs to the controller: a manual change is reverted at once.
+		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.namespaceToPool)).
 		Named("jobpool").
 		Complete(r)
 }
 
-// poolsInNamespace enqueues every JobPool of the object's namespace;
-// Reconcile itself decides which of them is primary.
-func (r *JobPoolReconciler) poolsInNamespace(ctx context.Context, obj client.Object) []reconcile.Request {
-	var pools schedulingv1alpha1.JobPoolList
-	if err := r.List(ctx, &pools, client.InNamespace(obj.GetNamespace())); err != nil {
-		logf.FromContext(ctx).Error(err, "Failed to list JobPools", "namespace", obj.GetNamespace())
-		return nil
+// jobToPool maps a Job to the JobPool of its namespace.
+// A queued Job is mapped even without a JobPool: it must not stay queued forever.
+func (r *JobPoolReconciler) jobToPool(ctx context.Context, obj client.Object) []reconcile.Request {
+	queued := obj.GetLabels()[schedulingv1alpha1.QueuedLabel] == schedulingv1alpha1.LabelTrue
+	return r.poolRequest(ctx, obj.GetNamespace(), queued)
+}
+
+// namespaceToPool maps a Namespace to its JobPool.
+// A labelled namespace is mapped even without a JobPool: the label must be removed.
+func (r *JobPoolReconciler) namespaceToPool(ctx context.Context, obj client.Object) []reconcile.Request {
+	_, labelled := obj.GetLabels()[schedulingv1alpha1.EnabledNamespaceLabel]
+	return r.poolRequest(ctx, obj.GetName(), labelled)
+}
+
+// poolRequest returns the request for the JobPool of the namespace if it exists in
+// the cache, or if force is set. Without the check every Job of the cluster would
+// trigger a reconcile with API server reads.
+func (r *JobPoolReconciler) poolRequest(ctx context.Context, namespace string, force bool) []reconcile.Request {
+	key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
+	if !force {
+		err := r.Get(ctx, key, &schedulingv1alpha1.JobPool{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			logf.FromContext(ctx).Error(err, "Failed to get JobPool", "namespace", namespace)
+		}
 	}
-	requests := make([]reconcile.Request, 0, len(pools.Items))
-	for _, pool := range pools.Items {
-		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pool)})
-	}
-	return requests
+	return []reconcile.Request{{NamespacedName: key}}
 }

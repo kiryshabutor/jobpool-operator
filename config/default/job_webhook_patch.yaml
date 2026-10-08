@@ -1,0 +1,27 @@
+# The Job webhook uses failurePolicy: Fail. Two filters keep an operator outage from
+# blocking more than it must; controller-gen markers cannot set either of them.
+#
+# namespaceSelector: the API server calls the webhook only for namespaces the
+# controller has labelled (namespaces with a JobPool).
+#
+# matchConditions: on UPDATE the webhook is called only when the Job is resumed
+# (spec.suspend true -> false). Other updates (labels, finalizers set by the
+# garbage collector) do not depend on the operator.
+#
+# The "test" op makes the build fail if webhooks[0] is not the Job webhook.
+- op: test
+  path: /webhooks/0/name
+  value: mjob.kiribu.dev
+- op: add
+  path: /webhooks/0/namespaceSelector
+  value:
+    matchLabels:
+      jobpool.kiribu.dev/enabled: "true"
+- op: add
+  path: /webhooks/0/matchConditions
+  value:
+  - name: create-or-resume
+    expression: >-
+      request.operation == 'CREATE' ||
+      (has(oldObject.spec.suspend) && oldObject.spec.suspend &&
+      !(has(object.spec.suspend) && object.spec.suspend))

@@ -40,7 +40,8 @@ spec:
       openAPIV3Schema:
         description: |-
           JobPool limits the number of concurrently active Jobs in its namespace.
-          Only one JobPool per namespace is allowed.
+          Only one JobPool per namespace is allowed: it must be named "default", so the
+          API server itself rejects a second one (names are unique within a namespace).
         properties:
           apiVersion:
             description: |-
@@ -87,7 +88,7 @@ spec:
                 description: |-
                   conditions represent the current state of the JobPool resource.
                   The "Ready" condition is True when this JobPool manages the queue of its
-                  namespace; reasons: Active, Duplicate, Terminating.
+                  namespace; reasons: Active, Terminating.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -160,6 +161,10 @@ spec:
         required:
         - spec
         type: object
+        x-kubernetes-validations:
+        - message: 'JobPool must be named ''default'': only one JobPool per namespace
+            is allowed'
+          rule: self.metadata.name == 'default'
     served: true
     storage: true
     subresources:

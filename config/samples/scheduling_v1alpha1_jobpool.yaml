@@ -4,7 +4,8 @@ metadata:
   labels:
     app.kubernetes.io/name: jobpool-operator
     app.kubernetes.io/managed-by: kustomize
-  name: jobpool-sample
+  # The only allowed name: one JobPool per namespace.
+  name: default
 spec:
   # At most 2 Jobs run at the same time in this namespace, the rest wait in a FIFO queue.
   maxConcurrentJobs: 2

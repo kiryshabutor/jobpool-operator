@@ -18,20 +18,29 @@ package v1
 
 import (
 	"context"
+	"encoding/json"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
 	admissionv1 "k8s.io/api/admission/v1"
+	authenticationv1 "k8s.io/api/authentication/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 )
+
+// userLabels are set by the user; the webhook must keep them.
+func userLabels() map[string]string {
+	return map[string]string{"app": "demo"}
+}
 
 func newNamespace() string {
 	ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "job-webhook-"}}
@@ -41,7 +50,7 @@ func newNamespace() string {
 
 func newPool(namespace string) *schedulingv1alpha1.JobPool {
 	pool := &schedulingv1alpha1.JobPool{
-		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: schedulingv1alpha1.PoolName, Namespace: namespace},
 		Spec:       schedulingv1alpha1.JobPoolSpec{MaxConcurrentJobs: 1},
 	}
 	Expect(k8sClient.Create(ctx, pool)).To(Succeed())
@@ -62,6 +71,11 @@ func newJob(namespace string) *batchv1.Job {
 	}
 }
 
+func suspended(job *batchv1.Job) *batchv1.Job {
+	job.Spec.Suspend = new(true)
+	return job
+}
+
 func expectQueued(job *batchv1.Job) {
 	ExpectWithOffset(1, job.Spec.Suspend).To(HaveValue(BeTrue()))
 	ExpectWithOffset(1, job.Labels).To(HaveKeyWithValue(schedulingv1alpha1.QueuedLabel, schedulingv1alpha1.LabelTrue))
@@ -72,42 +86,84 @@ func expectUntouched(job *batchv1.Job) {
 	ExpectWithOffset(1, job.Labels).NotTo(HaveKey(schedulingv1alpha1.QueuedLabel))
 }
 
+func expectRunning(job *batchv1.Job) {
+	ExpectWithOffset(1, job.Spec.Suspend).To(HaveValue(BeFalse()))
+	ExpectWithOffset(1, job.Labels).NotTo(HaveKey(schedulingv1alpha1.QueuedLabel))
+}
+
+// request returns a context with the admission request the webhook server would pass to Default.
+func request(op admissionv1.Operation, namespace, user string, oldJob *batchv1.Job) context.Context {
+	req := admissionv1.AdmissionRequest{
+		Operation: op,
+		Namespace: namespace,
+		UserInfo:  authenticationv1.UserInfo{Username: user},
+	}
+	if oldJob != nil {
+		raw, err := json.Marshal(oldJob)
+		Expect(err).NotTo(HaveOccurred())
+		req.OldObject = runtime.RawExtension{Raw: raw}
+	}
+	return admission.NewContextWithRequest(ctx, admission.Request{AdmissionRequest: req})
+}
+
+// resume patches spec.suspend=false as `kubectl patch` would; the operator also removes the label.
+func resume(c client.Client, job *batchv1.Job) {
+	base := job.DeepCopy()
+	job.Spec.Suspend = new(false)
+	if c == operatorClient {
+		delete(job.Labels, schedulingv1alpha1.QueuedLabel)
+	}
+	ExpectWithOffset(1, c.Patch(ctx, job, client.MergeFrom(base))).To(Succeed())
+}
+
+// emptyCache is a cache that has not seen any JobPool yet.
+type emptyCache struct{}
+
+func (emptyCache) Get(_ context.Context, key client.ObjectKey, _ client.Object, _ ...client.GetOption) error {
+	return apierrors.NewNotFound(schedulingv1alpha1.GroupVersion.WithResource("jobpools").GroupResource(), key.Name)
+}
+
+func (emptyCache) List(context.Context, client.ObjectList, ...client.ListOption) error {
+	return nil
+}
+
 var _ = Describe("Job Webhook", func() {
 	var (
 		namespace string
 		defaulter JobDefaulter
+		create    context.Context
 	)
 
 	BeforeEach(func() {
 		namespace = newNamespace()
 		// Read directly from the API server so a freshly created JobPool is visible at once.
-		defaulter = JobDefaulter{Reader: k8sClient}
+		defaulter = JobDefaulter{Cache: k8sClient, APIReader: k8sClient, OperatorUser: operatorUser}
+		create = request(admissionv1.Create, namespace, "user", nil)
 	})
 
-	Context("When calling Default", func() {
+	Context("When calling Default on CREATE", func() {
 		It("does not touch a Job in a namespace without JobPool", func() {
 			job := newJob(namespace)
-			Expect(defaulter.Default(ctx, job)).To(Succeed())
+			Expect(defaulter.Default(create, job)).To(Succeed())
 			expectUntouched(job)
 		})
 
 		It("queues a Job in a namespace with JobPool", func() {
 			newPool(namespace)
 			job := newJob(namespace)
-			job.Labels = map[string]string{"app": "demo"}
+			job.Labels = userLabels()
 
-			Expect(defaulter.Default(ctx, job)).To(Succeed())
+			Expect(defaulter.Default(create, job)).To(Succeed())
 
 			expectQueued(job)
-			Expect(job.Labels).To(HaveKeyWithValue("app", "demo"), "user labels are kept")
+			Expect(job.Labels).To(HaveLen(len(userLabels())+1), "user labels are kept")
 		})
 
 		It("does not queue a Job suspended by the user", func() {
 			newPool(namespace)
-			job := newJob(namespace)
-			job.Spec.Suspend = new(true)
+			job := suspended(newJob(namespace))
 
-			Expect(defaulter.Default(ctx, job)).To(Succeed())
+			Expect(defaulter.Default(create, job)).To(Succeed())
 
 			Expect(job.Spec.Suspend).To(HaveValue(BeTrue()))
 			Expect(job.Labels).NotTo(HaveKey(schedulingv1alpha1.QueuedLabel))
@@ -126,33 +182,121 @@ var _ = Describe("Job Webhook", func() {
 			})
 
 			job := newJob(namespace)
-			Expect(defaulter.Default(ctx, job)).To(Succeed())
+			Expect(defaulter.Default(create, job)).To(Succeed())
 			expectUntouched(job)
 		})
 
 		It("uses the namespace of the admission request when the object has none", func() {
 			newPool(namespace)
 			job := newJob("")
-			reqCtx := admission.NewContextWithRequest(context.Background(), admission.Request{
-				AdmissionRequest: admissionv1.AdmissionRequest{Namespace: namespace},
-			})
 
-			Expect(defaulter.Default(reqCtx, job)).To(Succeed())
+			Expect(defaulter.Default(create, job)).To(Succeed())
 			expectQueued(job)
+		})
+
+		It("reads the JobPool from the API server when the cache does not have it yet", func() {
+			newPool(namespace)
+			defaulter.Cache = emptyCache{}
+			job := newJob(namespace)
+
+			Expect(defaulter.Default(create, job)).To(Succeed())
+			expectQueued(job)
+		})
+
+		It("fails without an admission request", func() {
+			Expect(defaulter.Default(ctx, newJob(namespace))).NotTo(Succeed())
 		})
 	})
 
-	Context("When creating a Job through the API server", func() {
-		It("stores the Job already suspended", func() {
+	Context("When calling Default on UPDATE", func() {
+		BeforeEach(func() {
 			newPool(namespace)
+		})
 
-			// The webhook server reads JobPools from the manager's cache, which may lag a moment.
-			Eventually(func(g Gomega) {
-				job := newJob(namespace)
-				g.Expect(k8sClient.Create(ctx, job)).To(Succeed())
-				g.Expect(job.Spec.Suspend).To(HaveValue(BeTrue()))
-				g.Expect(job.Labels).To(HaveKeyWithValue(schedulingv1alpha1.QueuedLabel, schedulingv1alpha1.LabelTrue))
-			}).Should(Succeed())
+		It("puts a Job resumed by a user back into the queue", func() {
+			oldJob := suspended(newJob(namespace))
+			job := newJob(namespace)
+			job.Spec.Suspend = new(false)
+
+			Expect(defaulter.Default(request(admissionv1.Update, namespace, "user", oldJob), job)).To(Succeed())
+			expectQueued(job)
+		})
+
+		It("lets the operator resume a Job", func() {
+			oldJob := suspended(newJob(namespace))
+			job := newJob(namespace)
+			job.Spec.Suspend = new(false)
+
+			Expect(defaulter.Default(request(admissionv1.Update, namespace, operatorUser, oldJob), job)).To(Succeed())
+			expectRunning(job)
+		})
+
+		It("does not touch an update that does not resume the Job", func() {
+			oldJob := newJob(namespace)
+			job := newJob(namespace)
+			job.Labels = userLabels()
+
+			Expect(defaulter.Default(request(admissionv1.Update, namespace, "user", oldJob), job)).To(Succeed())
+			Expect(job.Spec.Suspend).To(BeNil())
+			Expect(job.Labels).To(Equal(userLabels()))
+		})
+
+		It("fails on a malformed old object", func() {
+			ctx := admission.NewContextWithRequest(ctx, admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Update,
+				Namespace: namespace,
+				OldObject: runtime.RawExtension{Raw: []byte("{")},
+			}})
+			Expect(defaulter.Default(ctx, newJob(namespace))).NotTo(Succeed())
+		})
+	})
+
+	// Requests go through the real API server and the webhook server of the manager,
+	// which reads JobPools from its cache.
+	Context("When going through the API server", func() {
+		It("stores a new Job already suspended", func() {
+			newPool(namespace)
+			job := newJob(namespace)
+
+			// One attempt only: if the cache lags, the webhook falls back to the API server.
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			expectQueued(job)
+		})
+
+		It("keeps a queued Job in the queue when a user resumes it", func() {
+			newPool(namespace)
+			job := newJob(namespace)
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+			resume(k8sClient, job)
+			expectQueued(job)
+		})
+
+		It("queues a Job suspended by the user when the user resumes it", func() {
+			newPool(namespace)
+			job := suspended(newJob(namespace))
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+			Expect(job.Labels).NotTo(HaveKey(schedulingv1alpha1.QueuedLabel))
+
+			resume(k8sClient, job)
+			expectQueued(job)
+		})
+
+		It("lets the operator start a queued Job", func() {
+			newPool(namespace)
+			job := newJob(namespace)
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+			resume(operatorClient, job)
+			expectRunning(job)
+		})
+
+		It("lets a user resume a Job in a namespace without JobPool", func() {
+			job := suspended(newJob(namespace))
+			Expect(k8sClient.Create(ctx, job)).To(Succeed())
+
+			resume(k8sClient, job)
+			expectRunning(job)
 		})
 	})
 })

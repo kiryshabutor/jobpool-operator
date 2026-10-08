@@ -246,3 +246,49 @@ func jobNames(jobs []*batchv1.Job) []string {
 	}
 	return names
 }
+
+func TestIsResumed(t *testing.T) {
+	running := newJob("a", 0)
+	paused := newJob("a", 0, userSuspended)
+	inQueue := newJob("a", 0, queued)
+	finishedPaused := newJob("a", 0, userSuspended, complete)
+	tests := []struct {
+		name           string
+		oldJob, newJob batchv1.Job
+		want           bool
+	}{
+		{name: "queued Job resumed", oldJob: inQueue, newJob: running, want: true},
+		{name: "user-paused Job resumed", oldJob: paused, newJob: running, want: true},
+		{name: "running Job stays running", oldJob: running, newJob: running},
+		{name: "running Job paused", oldJob: running, newJob: paused},
+		{name: "paused Job stays paused", oldJob: paused, newJob: inQueue},
+		{name: "finished Job resumed", oldJob: finishedPaused, newJob: running},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsResumed(&tt.oldJob, &tt.newJob); got != tt.want {
+				t.Errorf("IsResumed() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEnqueue(t *testing.T) {
+	for _, job := range []batchv1.Job{
+		newJob("no-labels", 0),
+		newJob("user-labels", 0, func(j *batchv1.Job) { j.Labels = map[string]string{"app": "demo"} }),
+	} {
+		t.Run(job.Name, func(t *testing.T) {
+			wantLabels := len(job.Labels) + 1
+
+			Enqueue(&job)
+
+			if !IsQueued(&job) {
+				t.Errorf("IsQueued() = false after Enqueue()")
+			}
+			if len(job.Labels) != wantLabels {
+				t.Errorf("Enqueue() labels = %v, want the queued label added to the existing ones", job.Labels)
+			}
+		})
+	}
+}

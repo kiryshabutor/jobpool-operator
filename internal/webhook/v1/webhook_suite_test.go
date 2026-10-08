@@ -30,6 +30,8 @@ import (
 	. "github.com/onsi/gomega"
 
 	batchv1 "k8s.io/api/batch/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -41,19 +43,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
-	webhookv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
 // These tests use Ginkgo (BDD-style Go testing framework). Refer to
 // http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
 
+// operatorUser stands for the operator's service account: the webhook lets only
+// this user resume queued Jobs. k8sClient acts as an ordinary user.
+const operatorUser = "system:serviceaccount:jobpool-operator-system:jobpool-operator-controller-manager"
+
 var (
 	ctx       context.Context
 	cancel    context.CancelFunc
 	k8sClient client.Client
-	cfg       *rest.Config
-	testEnv   *envtest.Environment
+	// operatorClient impersonates operatorUser.
+	operatorClient client.Client
+	cfg            *rest.Config
+	testEnv        *envtest.Environment
 )
 
 func TestAPIs(t *testing.T) {
@@ -99,6 +106,16 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 	Expect(k8sClient).NotTo(BeNil())
 
+	Expect(k8sClient.Create(ctx, &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{Name: "operator-is-admin"},
+		RoleRef:    rbacv1.RoleRef{APIGroup: rbacv1.GroupName, Kind: "ClusterRole", Name: "cluster-admin"},
+		Subjects:   []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: rbacv1.UserKind, Name: operatorUser}},
+	})).To(Succeed())
+	operatorCfg := rest.CopyConfig(cfg)
+	operatorCfg.Impersonate = rest.ImpersonationConfig{UserName: operatorUser}
+	operatorClient, err = client.New(operatorCfg, client.Options{Scheme: scheme.Scheme})
+	Expect(err).NotTo(HaveOccurred())
+
 	// start webhook server using Manager.
 	webhookInstallOptions := &testEnv.WebhookInstallOptions
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
@@ -113,10 +130,7 @@ var _ = BeforeSuite(func() {
 	})
 	Expect(err).NotTo(HaveOccurred())
 
-	err = SetupJobWebhookWithManager(mgr)
-	Expect(err).NotTo(HaveOccurred())
-	// envtest installs every webhook from config/webhook, so the JobPool webhook must be served too.
-	err = webhookv1alpha1.SetupJobPoolWebhookWithManager(mgr)
+	err = SetupJobWebhookWithManager(mgr, operatorUser)
 	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:webhook

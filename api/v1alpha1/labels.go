@@ -18,12 +18,17 @@ package v1alpha1
 
 // Names shared by the Job webhook and the JobPool controller.
 const (
+	// PoolName is the only allowed name of a JobPool (CEL rule in the CRD).
+	PoolName = "default"
+
 	// QueuedLabel marks a Job that was suspended by the webhook and waits in the queue.
 	// Suspended Jobs without this label belong to the user and are never started.
 	QueuedLabel = "jobpool.kiribu.dev/queued"
 
-	// EnabledNamespaceLabel is set by the controller on namespaces that have a JobPool.
-	// The Job webhook is only called for namespaces with this label.
+	// EnabledNamespaceLabel is set by the controller on namespaces that have a JobPool
+	// and removed from namespaces that have none. The Job webhook is only called for
+	// namespaces with this label. The label belongs to the controller: manual changes
+	// are reverted.
 	EnabledNamespaceLabel = "jobpool.kiribu.dev/enabled"
 
 	// LabelTrue is the value of QueuedLabel and EnabledNamespaceLabel.
@@ -38,10 +43,8 @@ const (
 	// ConditionReady is True when the JobPool manages the queue of its namespace.
 	ConditionReady = "Ready"
 
-	// ReasonActive: the JobPool is the primary one in the namespace and manages the queue.
+	// ReasonActive: the JobPool manages the queue.
 	ReasonActive = "Active"
-	// ReasonDuplicate: another, older JobPool already manages the namespace.
-	ReasonDuplicate = "Duplicate"
 	// ReasonTerminating: the JobPool is being deleted and releases its queue.
 	ReasonTerminating = "Terminating"
 )

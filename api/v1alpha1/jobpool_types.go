@@ -49,7 +49,7 @@ type JobPoolStatus struct {
 
 	// conditions represent the current state of the JobPool resource.
 	// The "Ready" condition is True when this JobPool manages the queue of its
-	// namespace; reasons: Active, Duplicate, Terminating.
+	// namespace; reasons: Active, Terminating.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -65,9 +65,11 @@ type JobPoolStatus struct {
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].reason`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
+// +kubebuilder:validation:XValidation:rule="self.metadata.name == 'default'",message="JobPool must be named 'default': only one JobPool per namespace is allowed"
 
 // JobPool limits the number of concurrently active Jobs in its namespace.
-// Only one JobPool per namespace is allowed.
+// Only one JobPool per namespace is allowed: it must be named "default", so the
+// API server itself rejects a second one (names are unique within a namespace).
 type JobPool struct {
 	metav1.TypeMeta `json:",inline"`
 

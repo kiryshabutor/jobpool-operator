@@ -20,10 +20,13 @@ limitations under the License.
 package e2e
 
 import (
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"os/exec"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -38,7 +41,9 @@ import (
 const (
 	queuedLabel  = "jobpool.kiribu.dev/queued"
 	enabledLabel = "jobpool.kiribu.dev/enabled"
+	poolName     = "default"
 	managerName  = "jobpool-operator-controller-manager"
+	leaseName    = "b4772dc6.kiribu.dev"
 
 	queueTimeout = 3 * time.Minute
 )
@@ -49,25 +54,33 @@ const (
 func jobPoolScenarios() {
 	It("never runs more Jobs than maxConcurrentJobs", func() {
 		ns := createNamespace("e2e-limit")
-		createPool(ns, "pool", 2)
+		createPool(ns, 2)
+
+		// All at once: concurrent admission requests must not let extra Jobs through.
+		var wg sync.WaitGroup
+		errs := make(chan error, 5)
 		for range 5 {
-			createJob(ns, 15, false)
+			wg.Go(func() {
+				_, err := tryCreateJob(ns, 15, false)
+				errs <- err
+			})
+		}
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			Expect(err).NotTo(HaveOccurred())
 		}
 
-		// Eventually retries failed polls, so the peak is tracked and checked separately.
-		peak := 0
 		Eventually(func(g Gomega) {
-			jobs := listJobs(ns)
-			peak = max(peak, countActive(jobs))
-			g.Expect(countComplete(jobs)).To(Equal(5))
+			g.Expect(countComplete(listJobs(ns))).To(Equal(5))
 		}, queueTimeout, 2*time.Second).Should(Succeed())
-		Expect(peak).To(Equal(2), "the pool must run exactly maxConcurrentJobs Jobs at its peak")
+		Expect(peakRunning(listJobs(ns))).To(Equal(2), "the pool must run exactly maxConcurrentJobs Jobs at its peak")
 	})
 
 	It("starts queued Jobs in creation order", func() {
 		ns := createNamespace("e2e-fifo")
-		createPool(ns, "pool", 1)
-		var names []string
+		createPool(ns, 1)
+		names := make([]string, 0, 4)
 		for range 4 {
 			names = append(names, createJob(ns, 3, false))
 			time.Sleep(time.Second)
@@ -103,19 +116,21 @@ func jobPoolScenarios() {
 		}).Should(Succeed())
 	})
 
-	It("rejects a second JobPool in the same namespace", func() {
+	It("allows only one JobPool per namespace", func() {
 		ns := createNamespace("e2e-singleton")
-		createPool(ns, "first", 1)
+		createPool(ns, 1)
 
-		err := applyPool(ns, "second", 1)
+		err := tryCreatePool(ns, poolName, 1)
+		Expect(err).To(MatchError(ContainSubstring("already exists")))
 
+		err = tryCreatePool(ns, "second", 1)
 		Expect(err).To(MatchError(ContainSubstring(
-			`JobPool "first" already exists in namespace "` + ns + `"; only one JobPool per namespace is allowed`)))
+			"JobPool must be named 'default': only one JobPool per namespace is allowed")))
 	})
 
 	It("leaves a Job suspended by the user alone", func() {
 		ns := createNamespace("e2e-user-pause")
-		createPool(ns, "pool", 2)
+		createPool(ns, 2)
 		name := createJob(ns, 1, true)
 
 		Consistently(func(g Gomega) {
@@ -125,9 +140,29 @@ func jobPoolScenarios() {
 		}, 20*time.Second, 2*time.Second).Should(Succeed())
 	})
 
+	It("puts a Job resumed by the user back into the queue", func() {
+		ns := createNamespace("e2e-user-resume")
+		createPool(ns, 1)
+		createJob(ns, 30, false)
+		queued := createJob(ns, 1, false)
+		paused := createJob(ns, 1, true)
+		Eventually(func(g Gomega) {
+			g.Expect(countActive(listJobs(ns))).To(Equal(1))
+		}).Should(Succeed())
+
+		kubectl("patch", "job", queued, "-n", ns, "--type=merge", "-p", `{"spec":{"suspend":false}}`)
+		kubectl("patch", "job", paused, "-n", ns, "--type=merge", "-p", `{"spec":{"suspend":false}}`)
+
+		Consistently(func(g Gomega) {
+			jobs := listJobs(ns)
+			g.Expect(countActive(jobs)).To(Equal(1))
+			g.Expect(countQueued(jobs)).To(Equal(2))
+		}, 15*time.Second, time.Second).Should(Succeed())
+	})
+
 	It("releases the whole queue when the JobPool is deleted", func() {
 		ns := createNamespace("e2e-delete")
-		createPool(ns, "pool", 1)
+		createPool(ns, 1)
 		for range 4 {
 			createJob(ns, 30, false)
 		}
@@ -135,7 +170,7 @@ func jobPoolScenarios() {
 			g.Expect(countQueued(listJobs(ns))).To(Equal(3))
 		}).Should(Succeed())
 
-		kubectl("delete", "jobpool", "pool", "-n", ns)
+		kubectl("delete", "jobpool", poolName, "-n", ns)
 
 		Eventually(func(g Gomega) {
 			jobs := listJobs(ns)
@@ -147,10 +182,34 @@ func jobPoolScenarios() {
 		}).Should(Succeed())
 	})
 
+	It("keeps the queue and the limit when the leader fails over", func() {
+		ns := createNamespace("e2e-failover")
+		createPool(ns, 1)
+		for range 3 {
+			createJob(ns, 10, false)
+		}
+		Eventually(func(g Gomega) {
+			g.Expect(countActive(listJobs(ns))).To(Equal(1))
+		}).Should(Succeed())
+
+		leader := leaderPod()
+		kubectl("delete", "pod", leader, "-n", namespace, "--wait=false")
+		kubectl("wait", "--for=delete", "pod/"+leader, "-n", namespace, "--timeout=1m")
+		// The other replica serves the webhook, even before the replacement pod is ready.
+		createJob(ns, 10, false)
+
+		Eventually(func(g Gomega) {
+			g.Expect(countComplete(listJobs(ns))).To(Equal(4))
+		}, queueTimeout, 2*time.Second).Should(Succeed())
+		Expect(peakRunning(listJobs(ns))).To(Equal(1))
+		Expect(leaderPod()).NotTo(Equal(leader))
+		kubectl("rollout", "status", "deployment", managerName, "-n", namespace, "--timeout=2m")
+	})
+
 	// Runs last: it scales the manager down and back up.
 	It("blocks Job creation only in JobPool namespaces while the webhook is down", func() {
 		pooled := createNamespace("e2e-webhook-down")
-		createPool(pooled, "pool", 1)
+		createPool(pooled, 1)
 		plain := createNamespace("e2e-webhook-down-plain")
 
 		scaleManager(0)
@@ -183,16 +242,15 @@ func createNamespace(name string) string {
 	return name
 }
 
-// createPool creates a JobPool and waits until the controller labels the namespace,
-// i.e. until the Job webhook is active for it.
-func createPool(ns, name string, maxJobs int) {
-	Expect(applyPool(ns, name, maxJobs)).To(Succeed())
-	Eventually(func(g Gomega) {
-		g.Expect(namespaceLabels(ns)).To(HaveKeyWithValue(enabledLabel, "true"))
-	}).Should(Succeed())
+// createPool creates the JobPool and waits until it is Ready: from then on the
+// Job webhook is active for the namespace.
+func createPool(ns string, maxJobs int) {
+	Expect(tryCreatePool(ns, poolName, maxJobs)).To(Succeed())
+	kubectl("wait", "--for=condition=Ready", "jobpool/"+poolName, "-n", ns, "--timeout=1m")
+	Expect(namespaceLabels(ns)).To(HaveKeyWithValue(enabledLabel, "true"))
 }
 
-func applyPool(ns, name string, maxJobs int) error {
+func tryCreatePool(ns, name string, maxJobs int) error {
 	manifest := fmt.Sprintf(`apiVersion: scheduling.kiribu.dev/v1alpha1
 kind: JobPool
 metadata:
@@ -201,9 +259,9 @@ metadata:
 spec:
   maxConcurrentJobs: %d
 `, name, ns, maxJobs)
-	cmd := exec.Command("kubectl", "apply", "-f", "-")
+	cmd := exec.Command("kubectl", "create", "-f", "-")
 	cmd.Stdin = strings.NewReader(manifest)
-	// Not utils.Run: it quotes the output with %q, which escapes the admission message.
+	// Not utils.Run: it quotes the output with %q, which escapes the API server message.
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("%w: %s", err, out)
 	}
@@ -213,7 +271,7 @@ spec:
 // createJob creates a busybox Job sleeping for the given seconds and returns its name.
 func createJob(ns string, sleepSeconds int, suspend bool) string {
 	name, err := tryCreateJob(ns, sleepSeconds, suspend)
-	Expect(err).NotTo(HaveOccurred())
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
 	return name
 }
 
@@ -262,6 +320,17 @@ func namespaceLabels(ns string) map[string]string {
 	var namespace corev1.Namespace
 	getJSON(&namespace, "get", "ns", ns)
 	return namespace.Labels
+}
+
+// leaderPod returns the name of the manager pod holding the leader election lease.
+func leaderPod() string {
+	out, err := exec.Command("kubectl", "get", "lease", leaseName, "-n", namespace,
+		"-o", "jsonpath={.spec.holderIdentity}").Output()
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	// holderIdentity is "<pod name>_<random id>".
+	pod, _, _ := strings.Cut(string(out), "_")
+	ExpectWithOffset(1, pod).NotTo(BeEmpty())
+	return pod
 }
 
 // getJSON reads stdout only: kubectl warnings on stderr would break the JSON.
@@ -322,4 +391,34 @@ func countQueued(jobs []batchv1.Job) int {
 		}
 	}
 	return n
+}
+
+// peakRunning returns the largest number of completed Jobs that ran at the same time.
+// It uses status.startTime (reset when a Job is resumed) and status.completionTime,
+// so unlike polling it cannot miss a short overlap of more than a second.
+func peakRunning(jobs []batchv1.Job) int {
+	type event struct {
+		at    time.Time
+		delta int
+	}
+	events := make([]event, 0, 2*len(jobs))
+	for _, job := range jobs {
+		ExpectWithOffset(1, job.Status.StartTime).NotTo(BeNil(), "Job %s has no startTime", job.Name)
+		ExpectWithOffset(1, job.Status.CompletionTime).NotTo(BeNil(), "Job %s has no completionTime", job.Name)
+		events = append(events, event{job.Status.StartTime.Time, +1}, event{job.Status.CompletionTime.Time, -1})
+	}
+	// The controller starts the next Job only after the previous one has completed, so
+	// within the same second (timestamps have a one-second resolution) completion goes first.
+	slices.SortFunc(events, func(a, b event) int {
+		if c := a.at.Compare(b.at); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.delta, b.delta)
+	})
+	peak, running := 0, 0
+	for _, e := range events {
+		running += e.delta
+		peak = max(peak, running)
+	}
+	return peak
 }

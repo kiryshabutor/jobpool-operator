@@ -29,6 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 )
@@ -46,11 +47,15 @@ func newNamespace() string {
 	return ns.Name
 }
 
-func createPool(namespace, name string, maxJobs int32) *schedulingv1alpha1.JobPool {
-	pool := &schedulingv1alpha1.JobPool{
+func newPool(namespace, name string, maxJobs int32) *schedulingv1alpha1.JobPool {
+	return &schedulingv1alpha1.JobPool{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
 		Spec:       schedulingv1alpha1.JobPoolSpec{MaxConcurrentJobs: maxJobs},
 	}
+}
+
+func createPool(namespace string, maxJobs int32) *schedulingv1alpha1.JobPool {
+	pool := newPool(namespace, schedulingv1alpha1.PoolName, maxJobs)
 	ExpectWithOffset(1, k8sClient.Create(ctx, pool)).To(Succeed())
 	return pool
 }
@@ -131,15 +136,18 @@ func markComplete(namespace, name string) {
 	}, timeout, interval).Should(Succeed())
 }
 
-func expectStatus(namespace, name string, active, queued int32, reason string) {
+// expectStatus waits for the counters of an active JobPool.
+func expectStatus(namespace string, active, queued int32) {
 	EventuallyWithOffset(1, func(g Gomega) {
 		pool := &schedulingv1alpha1.JobPool{}
-		g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pool)).To(Succeed())
+		key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
+		g.Expect(k8sClient.Get(ctx, key, pool)).To(Succeed())
 		g.Expect(pool.Status.ActiveJobs).To(Equal(active))
 		g.Expect(pool.Status.QueuedJobs).To(Equal(queued))
 		cond := meta.FindStatusCondition(pool.Status.Conditions, schedulingv1alpha1.ConditionReady)
 		g.Expect(cond).NotTo(BeNil())
-		g.Expect(cond.Reason).To(Equal(reason))
+		g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+		g.Expect(cond.Reason).To(Equal(schedulingv1alpha1.ReasonActive))
 	}, timeout, interval).Should(Succeed())
 }
 
@@ -157,7 +165,7 @@ var _ = Describe("JobPool Controller", func() {
 	})
 
 	It("starts queued Jobs up to the limit", func() {
-		createPool(namespace, "pool", 2)
+		createPool(namespace, 2)
 		names := createQueuedJobs(namespace, 4)
 
 		Eventually(func(g Gomega) {
@@ -166,11 +174,11 @@ var _ = Describe("JobPool Controller", func() {
 		Consistently(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(HaveLen(2))
 		}, settle, interval).Should(Succeed())
-		expectStatus(namespace, "pool", 2, 2, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 2, 2)
 	})
 
 	It("starts the next Job in FIFO order when one finishes", func() {
-		createPool(namespace, "pool", 2)
+		createPool(namespace, 2)
 		names := createQueuedJobs(namespace, 4)
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:2]))
@@ -181,11 +189,11 @@ var _ = Describe("JobPool Controller", func() {
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:3]))
 		}, timeout, interval).Should(Succeed())
-		expectStatus(namespace, "pool", 2, 1, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 2, 1)
 	})
 
 	It("never starts a Job suspended by the user and does not count it", func() {
-		createPool(namespace, "pool", 1)
+		createPool(namespace, 1)
 		createJob(namespace, "user-paused", true, false)
 		names := createQueuedJobs(namespace, 1)
 
@@ -197,7 +205,7 @@ var _ = Describe("JobPool Controller", func() {
 			g.Expect(job.Spec.Suspend).To(HaveValue(BeTrue()))
 			g.Expect(job.Labels).NotTo(HaveKey(schedulingv1alpha1.QueuedLabel))
 		}, settle, interval).Should(Succeed())
-		expectStatus(namespace, "pool", 1, 0, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 1, 0)
 	})
 
 	It("does not suspend running Jobs when they exceed the limit", func() {
@@ -205,10 +213,10 @@ var _ = Describe("JobPool Controller", func() {
 		for _, name := range running {
 			createJob(namespace, name, false, false)
 		}
-		createPool(namespace, "pool", 2)
+		createPool(namespace, 2)
 		names := createQueuedJobs(namespace, 1)
 
-		expectStatus(namespace, "pool", 3, 1, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 3, 1)
 		Consistently(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, running)).To(Equal(running))
 			g.Expect(isQueued(getJob(g, namespace, names[0]))).To(BeTrue())
@@ -216,7 +224,7 @@ var _ = Describe("JobPool Controller", func() {
 
 		// 3 -> 2 active: still no free slot.
 		markComplete(namespace, running[0])
-		expectStatus(namespace, "pool", 2, 1, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 2, 1)
 		Consistently(func(g Gomega) {
 			g.Expect(isQueued(getJob(g, namespace, names[0]))).To(BeTrue())
 		}, settle, interval).Should(Succeed())
@@ -226,11 +234,11 @@ var _ = Describe("JobPool Controller", func() {
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names))
 		}, timeout, interval).Should(Succeed())
-		expectStatus(namespace, "pool", 2, 0, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 2, 0)
 	})
 
 	It("starts more Jobs when the limit is raised", func() {
-		pool := createPool(namespace, "pool", 1)
+		pool := createPool(namespace, 1)
 		names := createQueuedJobs(namespace, 4)
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:1]))
@@ -245,11 +253,11 @@ var _ = Describe("JobPool Controller", func() {
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:3]))
 		}, timeout, interval).Should(Succeed())
-		expectStatus(namespace, "pool", 3, 1, schedulingv1alpha1.ReasonActive)
+		expectStatus(namespace, 3, 1)
 	})
 
 	It("labels the namespace and adds the finalizer", func() {
-		pool := createPool(namespace, "pool", 1)
+		pool := createPool(namespace, 1)
 
 		Eventually(func(g Gomega) {
 			g.Expect(namespaceLabels(g, namespace)).To(
@@ -260,7 +268,7 @@ var _ = Describe("JobPool Controller", func() {
 	})
 
 	It("releases the whole queue when the JobPool is deleted", func() {
-		pool := createPool(namespace, "pool", 1)
+		pool := createPool(namespace, 1)
 		createJob(namespace, "user-paused", true, false)
 		names := createQueuedJobs(namespace, 3)
 		Eventually(func(g Gomega) {
@@ -281,27 +289,94 @@ var _ = Describe("JobPool Controller", func() {
 		}, timeout, interval).Should(Succeed())
 	})
 
-	It("ignores a duplicate JobPool and hands the queue over when the primary is deleted", func() {
-		// Without the validating webhook (not running in this suite) a second pool can be created.
-		primary := createPool(namespace, "a-primary", 1)
-		names := createQueuedJobs(namespace, 3)
+	It("allows only a JobPool named default", func() {
+		err := k8sClient.Create(ctx, newPool(namespace, "other", 1))
+		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "unexpected error: %v", err)
+		Expect(err).To(MatchError(ContainSubstring("only one JobPool per namespace is allowed")))
+
+		createPool(namespace, 1)
+		err = k8sClient.Create(ctx, newPool(namespace, schedulingv1alpha1.PoolName, 2))
+		Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "unexpected error: %v", err)
+	})
+
+	It("does not let a new JobPool appear while the old one releases its queue", func() {
+		// A foreign finalizer keeps the deleted JobPool around after ours is removed.
+		const hold = "test.kiribu.dev/hold"
+		pool := createPool(namespace, 1)
+		names := createQueuedJobs(namespace, 2)
 		Eventually(func(g Gomega) {
-			g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:1]))
+			g.Expect(runningJobs(g, namespace, names)).To(HaveLen(1))
+		}, timeout, interval).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
+			controllerutil.AddFinalizer(pool, hold)
+			g.Expect(k8sClient.Update(ctx, pool)).To(Succeed())
 		}, timeout, interval).Should(Succeed())
 
-		createPool(namespace, "b-duplicate", 2)
-		expectStatus(namespace, "b-duplicate", 0, 0, schedulingv1alpha1.ReasonDuplicate)
-		Consistently(func(g Gomega) {
-			g.Expect(runningJobs(g, namespace, names)).To(HaveLen(1))
-		}, settle, interval).Should(Succeed())
+		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
 
-		Expect(k8sClient.Delete(ctx, primary)).To(Succeed())
+		err := k8sClient.Create(ctx, newPool(namespace, schedulingv1alpha1.PoolName, 1))
+		Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "unexpected error: %v", err)
+		Eventually(func(g Gomega) {
+			g.Expect(runningJobs(g, namespace, names)).To(Equal(names))
+		}, timeout, interval).Should(Succeed())
 
-		// The duplicate becomes primary with its own limit; the queue is not released.
-		expectStatus(namespace, "b-duplicate", 2, 1, schedulingv1alpha1.ReasonActive)
-		Consistently(func(g Gomega) {
-			g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:2]))
-			g.Expect(namespaceLabels(g, namespace)).To(HaveKey(schedulingv1alpha1.EnabledNamespaceLabel))
-		}, settle, interval).Should(Succeed())
+		Eventually(func(g Gomega) {
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
+			controllerutil.RemoveFinalizer(pool, hold)
+			g.Expect(k8sClient.Update(ctx, pool)).To(Succeed())
+		}, timeout, interval).Should(Succeed())
+	})
+
+	It("starts a Job queued after the JobPool is gone", func() {
+		// The admission request passed the webhook while the JobPool existed and was stored
+		// after the finalizer had released the queue.
+		createJob(namespace, "late", true, true)
+
+		Eventually(func(g Gomega) {
+			g.Expect(runningJobs(g, namespace, []string{"late"})).To(Equal([]string{"late"}))
+		}, timeout, interval).Should(Succeed())
+	})
+
+	It("removes the enabled label from a namespace without JobPool", func() {
+		Eventually(func(g Gomega) {
+			ns := &corev1.Namespace{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
+			ns.Labels[schedulingv1alpha1.EnabledNamespaceLabel] = schedulingv1alpha1.LabelTrue
+			g.Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+		}, timeout, interval).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			g.Expect(namespaceLabels(g, namespace)).NotTo(HaveKey(schedulingv1alpha1.EnabledNamespaceLabel))
+		}, timeout, interval).Should(Succeed())
+	})
+
+	It("restores the enabled label when someone changes it", func() {
+		createPool(namespace, 1)
+		expectLabel := func() {
+			EventuallyWithOffset(1, func(g Gomega) {
+				g.Expect(namespaceLabels(g, namespace)).To(
+					HaveKeyWithValue(schedulingv1alpha1.EnabledNamespaceLabel, schedulingv1alpha1.LabelTrue))
+			}, timeout, interval).Should(Succeed())
+		}
+		setLabel := func(value *string) {
+			EventuallyWithOffset(1, func(g Gomega) {
+				ns := &corev1.Namespace{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
+				if value == nil {
+					delete(ns.Labels, schedulingv1alpha1.EnabledNamespaceLabel)
+				} else {
+					ns.Labels[schedulingv1alpha1.EnabledNamespaceLabel] = *value
+				}
+				g.Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+			}, timeout, interval).Should(Succeed())
+		}
+		expectLabel()
+
+		setLabel(new("false"))
+		expectLabel()
+
+		setLabel(nil)
+		expectLabel()
 	})
 })

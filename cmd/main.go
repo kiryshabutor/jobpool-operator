@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
 	"os"
@@ -25,9 +26,13 @@ import (
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	authenticationv1 "k8s.io/api/authentication/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/client-go/kubernetes"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
@@ -38,7 +43,6 @@ import (
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 	"github.com/kiryl-b-inno/jobpool-operator/internal/controller"
 	webhookv1 "github.com/kiryl-b-inno/jobpool-operator/internal/webhook/v1"
-	webhookv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -197,15 +201,14 @@ func main() {
 	}
 	// nolint:goconst
 	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhookv1.SetupJobWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to create webhook", "webhook", "Job")
+		operatorUser, err := whoAmI(mgr.GetConfig())
+		if err != nil {
+			setupLog.Error(err, "Failed to get the operator's own username")
 			os.Exit(1)
 		}
-	}
-	// nolint:goconst
-	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
-		if err := webhookv1alpha1.SetupJobPoolWebhookWithManager(mgr); err != nil {
-			setupLog.Error(err, "Failed to create webhook", "webhook", "JobPool")
+		setupLog.Info("Only the operator may resume queued Jobs", "user", operatorUser)
+		if err := webhookv1.SetupJobWebhookWithManager(mgr, operatorUser); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "Job")
 			os.Exit(1)
 		}
 	}
@@ -227,4 +230,20 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// whoAmI returns the username the operator talks to the API server with, like
+// `kubectl auth whoami`: the service account in the cluster, the kubeconfig user
+// with `make run`. Every authenticated user may create a SelfSubjectReview.
+func whoAmI(cfg *rest.Config) (string, error) {
+	clientset, err := kubernetes.NewForConfig(cfg)
+	if err != nil {
+		return "", err
+	}
+	review, err := clientset.AuthenticationV1().SelfSubjectReviews().Create(context.Background(),
+		&authenticationv1.SelfSubjectReview{}, metav1.CreateOptions{})
+	if err != nil {
+		return "", err
+	}
+	return review.Status.UserInfo.Username, nil
 }

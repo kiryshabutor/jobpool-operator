@@ -18,8 +18,12 @@ package v1
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 
+	admissionv1 "k8s.io/api/admission/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -30,61 +34,110 @@ import (
 )
 
 // SetupJobWebhookWithManager registers the webhook for Job in the manager.
-// JobPools are read from the manager's cache: the webhook is on the hot path of
-// every Job creation and must answer fast.
-func SetupJobWebhookWithManager(mgr ctrl.Manager) error {
+// operatorUser is the username of the operator itself: only it may resume queued Jobs.
+func SetupJobWebhookWithManager(mgr ctrl.Manager, operatorUser string) error {
 	return ctrl.NewWebhookManagedBy(mgr, &batchv1.Job{}).
-		WithDefaulter(&JobDefaulter{Reader: mgr.GetClient()}).
+		WithDefaulter(&JobDefaulter{
+			Cache:        mgr.GetClient(),
+			APIReader:    mgr.GetAPIReader(),
+			OperatorUser: operatorUser,
+		}).
 		Complete()
 }
 
-// The webhook only handles CREATE: suspending a running Job on UPDATE would kill its pods.
-// namespaceSelector (namespaces with a JobPool only) cannot be set by a marker and is
-// added by config/default/job_webhook_namespace_selector_patch.yaml.
-// +kubebuilder:webhook:path=/mutate-batch-v1-job,mutating=true,failurePolicy=fail,sideEffects=None,groups=batch,resources=jobs,verbs=create,versions=v1,name=mjob.kiribu.dev,admissionReviewVersions=v1,timeoutSeconds=5
+// On UPDATE the webhook only re-queues a Job that someone else resumes; it never
+// suspends a running Job, since that would kill its pods.
+// namespaceSelector (namespaces with a JobPool only) and matchConditions (only
+// CREATE and resuming UPDATE) cannot be set by a marker and are added by
+// config/default/job_webhook_patch.yaml.
+// +kubebuilder:webhook:path=/mutate-batch-v1-job,mutating=true,failurePolicy=fail,sideEffects=None,groups=batch,resources=jobs,verbs=create;update,versions=v1,name=mjob.kiribu.dev,admissionReviewVersions=v1,timeoutSeconds=5
 
-// JobDefaulter puts every new Job of a namespace with a JobPool into the queue:
-// it sets spec.suspend=true and the queued label. It never decides which Job
-// runs; the JobPool controller starts queued Jobs one by one within the limit.
+// JobDefaulter puts Jobs of a namespace with a JobPool into the queue
+// (spec.suspend=true and the queued label):
+//   - every new Job, unless the user creates it suspended;
+//   - every Job resumed by anyone but the operator, so nobody can start a Job past the limit.
+//
+// It never decides which Job runs; the JobPool controller starts queued Jobs
+// one by one within the limit.
 type JobDefaulter struct {
-	// Reader lists JobPools of the Job's namespace.
-	Reader client.Reader
+	// Cache is the manager's cache: the webhook is on the hot path of every Job
+	// creation and must answer fast.
+	Cache client.Reader
+	// APIReader reads the JobPool from the API server when the cache does not have it yet.
+	APIReader client.Reader
+	// OperatorUser is the username the operator talks to the API server with.
+	OperatorUser string
 }
 
 // Default implements admission.Defaulter so a webhook will be registered for the Kind Job.
 func (d *JobDefaulter) Default(ctx context.Context, job *batchv1.Job) error {
-	namespace := requestNamespace(ctx, job)
+	req, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return err
+	}
+	namespace := requestNamespace(req, job)
 	log := logf.FromContext(ctx).WithValues("namespace", namespace, "name", job.Name, "generateName", job.GenerateName)
 
-	if jobpool.IsSuspended(job) {
-		log.V(1).Info("Job is suspended by the user, not queueing")
+	switch req.Operation {
+	case admissionv1.Create:
+		if jobpool.IsSuspended(job) {
+			log.V(1).Info("Job is suspended by the user, not queueing")
+			return nil
+		}
+	case admissionv1.Update:
+		if req.UserInfo.Username == d.OperatorUser {
+			return nil
+		}
+		var oldJob batchv1.Job
+		if err := json.Unmarshal(req.OldObject.Raw, &oldJob); err != nil {
+			return fmt.Errorf("decoding the old Job: %w", err)
+		}
+		if !jobpool.IsResumed(&oldJob, job) {
+			return nil
+		}
+	default:
 		return nil
 	}
 
-	var pools schedulingv1alpha1.JobPoolList
-	if err := d.Reader.List(ctx, &pools, client.InNamespace(namespace)); err != nil {
+	pool, err := d.getPool(ctx, namespace)
+	if err != nil {
 		return err
 	}
-	pool := jobpool.Primary(pools.Items)
-	if pool == nil {
+	if pool == nil || !pool.DeletionTimestamp.IsZero() {
 		log.V(1).Info("No active JobPool in namespace, not queueing")
 		return nil
 	}
 
-	job.Spec.Suspend = new(true)
-	if job.Labels == nil {
-		job.Labels = map[string]string{}
-	}
-	job.Labels[schedulingv1alpha1.QueuedLabel] = schedulingv1alpha1.LabelTrue
-	log.V(1).Info("Job queued", "jobPool", pool.Name)
+	jobpool.Enqueue(job)
+	log.V(1).Info("Job queued", "operation", req.Operation, "user", req.UserInfo.Username)
 	return nil
+}
+
+// getPool returns the JobPool of the namespace, or nil if there is none.
+// The webhook is called only for namespaces labelled by the controller, so a
+// cache miss happens only right after the JobPool is created, while this replica's
+// cache lags behind; the API server is asked then.
+func (d *JobDefaulter) getPool(ctx context.Context, namespace string) (*schedulingv1alpha1.JobPool, error) {
+	key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
+	var pool schedulingv1alpha1.JobPool
+	err := d.Cache.Get(ctx, key, &pool)
+	if apierrors.IsNotFound(err) {
+		err = d.APIReader.Get(ctx, key, &pool)
+	}
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &pool, nil
 }
 
 // requestNamespace returns the namespace the Job is created in. The object in an
 // admission request may have an empty metadata.namespace (e.g. a manifest without
 // it, applied with -n); the namespace of the request itself is always set.
-func requestNamespace(ctx context.Context, job *batchv1.Job) string {
-	if req, err := admission.RequestFromContext(ctx); err == nil && req.Namespace != "" {
+func requestNamespace(req admission.Request, job *batchv1.Job) string {
+	if req.Namespace != "" {
 		return req.Namespace
 	}
 	return job.Namespace
