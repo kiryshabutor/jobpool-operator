@@ -81,6 +81,10 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
 		_, _ = utils.Run(cmd)
 
+		By("deleting JobPools while the controller can still remove their finalizers")
+		cmd = exec.Command("kubectl", "delete", "jobpools", "--all", "--all-namespaces", "--timeout=2m")
+		_, _ = utils.Run(cmd)
+
 		By("undeploying the controller-manager")
 		cmd = exec.Command("make", "undeploy")
 		_, _ = utils.Run(cmd)
@@ -100,7 +104,7 @@ var _ = Describe("Manager", Ordered, func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
 			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
+			cmd := exec.Command("kubectl", "logs", "-l", "control-plane=controller-manager", "--prefix", "--tail=-1", "-n", namespace)
 			controllerLogs, err := utils.Run(cmd)
 			if err == nil {
 				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
@@ -157,18 +161,21 @@ var _ = Describe("Manager", Ordered, func() {
 				podOutput, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
 				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
+				// The manager runs two replicas (leader + standby, both serve webhooks).
+				g.Expect(podNames).To(HaveLen(2), "expected 2 controller pods running")
 				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
 
-				By("validating the pod's status")
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
+				By("validating the pods' status")
+				for _, podName := range podNames {
+					g.Expect(podName).To(ContainSubstring("controller-manager"))
+					cmd = exec.Command("kubectl", "get",
+						"pods", podName, "-o", "jsonpath={.status.phase}",
+						"-n", namespace,
+					)
+					output, err := utils.Run(cmd)
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
+				}
 			}
 			Eventually(verifyControllerUp).Should(Succeed())
 		})
@@ -240,6 +247,8 @@ var _ = Describe("Manager", Ordered, func() {
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
 			By("creating the curl-metrics pod to access the metrics endpoint")
+			// The trailing dot makes the name fully qualified: no search domains from the
+			// host (e.g. a home router) are tried, so a slow host DNS cannot break the lookup.
 			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
 				"--namespace", namespace,
 				"--image=curlimages/curl:latest",
@@ -251,7 +260,7 @@ var _ = Describe("Manager", Ordered, func() {
 							"image": "curlimages/curl:latest",
 							"command": ["/bin/sh", "-c"],
 							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
+								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local.:8443/metrics && exit 0 || sleep 2; done; exit 1"
 							],
 							"securityContext": {
 								"readOnlyRootFilesystem": true,
@@ -343,6 +352,8 @@ var _ = Describe("Manager", Ordered, func() {
 		//    strings.ToLower(<Kind>),
 		// ))
 	})
+
+	Context("JobPool", jobPoolScenarios)
 })
 
 // serviceAccountToken returns a token for the specified service account in the given namespace.
