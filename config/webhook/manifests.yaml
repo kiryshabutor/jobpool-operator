@@ -12,7 +12,7 @@ webhooks:
       namespace: system
       path: /mutate-batch-v1-job
   failurePolicy: Fail
-  name: mjob-v1.kb.io
+  name: mjob.kiribu.dev
   rules:
   - apiGroups:
     - batch
@@ -20,10 +20,10 @@ webhooks:
     - v1
     operations:
     - CREATE
-    - UPDATE
     resources:
     - jobs
   sideEffects: None
+  timeoutSeconds: 5
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: ValidatingWebhookConfiguration

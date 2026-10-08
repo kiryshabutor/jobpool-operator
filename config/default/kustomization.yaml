@@ -53,6 +53,11 @@ patches:
   target:
     kind: Deployment
 
+# Limit the Job webhook to namespaces with a JobPool (label set by the controller).
+- path: job_webhook_namespace_selector_patch.yaml
+  target:
+    kind: MutatingWebhookConfiguration
+
 # [CERTMANAGER] To enable cert-manager, uncomment all sections with 'CERTMANAGER' prefix.
 # Uncomment the following replacements to add the cert-manager CA injection annotations
 replacements:
