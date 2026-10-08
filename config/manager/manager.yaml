@@ -21,7 +21,9 @@ spec:
     matchLabels:
       control-plane: controller-manager
       app.kubernetes.io/name: jobpool-operator
-  replicas: 1
+  # Two replicas: one holds the leader lease and reconciles, both serve webhooks.
+  # With failurePolicy: Fail a single replica would block Job creation while it restarts.
+  replicas: 2
   template:
     metadata:
       annotations:
@@ -30,6 +32,17 @@ spec:
         control-plane: controller-manager
         app.kubernetes.io/name: jobpool-operator
     spec:
+      # Prefer spreading the replicas across nodes so one node failure keeps a webhook alive.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  control-plane: controller-manager
+                  app.kubernetes.io/name: jobpool-operator
       # TODO(user): Uncomment the following code to configure the nodeAffinity expression
       # according to the platforms which are supported by your solution.
       # It is considered best practice to support multiple architectures. You can

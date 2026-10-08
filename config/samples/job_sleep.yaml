@@ -1,0 +1,15 @@
+# Demo Job: create it several times with `kubectl create -f` (generateName gives
+# each copy a unique name) and watch the JobPool keep the extra ones suspended.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: sleep-
+spec:
+  backoffLimit: 0
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: sleep
+        image: busybox:1.37
+        command: ["sh", "-c", "echo started; sleep 20; echo done"]

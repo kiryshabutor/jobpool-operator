@@ -38,7 +38,7 @@ func SetupJobPoolWebhookWithManager(mgr ctrl.Manager) error {
 }
 
 // Only CREATE is validated: the namespace of an existing object cannot change.
-// +kubebuilder:webhook:path=/validate-scheduling-kiribu-dev-v1alpha1-jobpool,mutating=false,failurePolicy=fail,sideEffects=None,groups=scheduling.kiribu.dev,resources=jobpools,verbs=create,versions=v1alpha1,name=vjobpool.kiribu.dev,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-scheduling-kiribu-dev-v1alpha1-jobpool,mutating=false,failurePolicy=fail,sideEffects=None,groups=scheduling.kiribu.dev,resources=jobpools,verbs=create,versions=v1alpha1,timeoutSeconds=5,name=vjobpool.kiribu.dev,admissionReviewVersions=v1
 
 // JobPoolValidator allows only one JobPool per namespace.
 // Two JobPools created at the same moment can both pass; the controller then

@@ -177,7 +177,9 @@ func main() {
 		// the manager stops, so would be fine to enable this option. However,
 		// if you are doing or is intended to do any operation such as perform cleanups
 		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		// The program exits right after the manager stops, so the standby replica
+		// can take over the queue without waiting for the lease to expire.
+		LeaderElectionReleaseOnCancel: true,
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
@@ -213,7 +215,9 @@ func main() {
 		setupLog.Error(err, "Failed to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	// Both replicas serve webhooks, so a pod is ready only once its webhook server
+	// is listening; otherwise the Service may route admission requests to it too early.
+	if err := mgr.AddReadyzCheck("readyz", webhookServer.StartedChecker()); err != nil {
 		setupLog.Error(err, "Failed to set up ready check")
 		os.Exit(1)
 	}

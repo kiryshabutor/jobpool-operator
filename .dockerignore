@@ -6,6 +6,10 @@
 # If you use Podman, re-include your source directories by name,
 # such as !cmd, !api, and !internal.
 # See https://github.com/containers/buildah/issues/6417
+# The legacy Docker builder (no buildx) needs the directories re-included by name too.
+!cmd
+!api
+!internal
 !**/*.go
 **/*_test.go
 

@@ -49,3 +49,4 @@ webhooks:
     resources:
     - jobpools
   sideEffects: None
+  timeoutSeconds: 5

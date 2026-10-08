@@ -1,0 +1,17 @@
+# Keeps at least one replica (and its webhook server) running during voluntary
+# disruptions such as `kubectl drain`, so Job creation is never blocked.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: controller-manager
+  namespace: system
+  labels:
+    control-plane: controller-manager
+    app.kubernetes.io/name: jobpool-operator
+    app.kubernetes.io/managed-by: kustomize
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: jobpool-operator
