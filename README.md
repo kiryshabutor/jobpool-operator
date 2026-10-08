@@ -1,121 +1,138 @@
 # jobpool-operator
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Kubernetes-оператор, который ограничивает число **одновременно работающих Job** в namespace.
 
-## Getting Started
+Админ создаёт в namespace ресурс `JobPool` с полем `maxConcurrentJobs`. После этого каждая новая Job в этом namespace
+создаётся **на паузе** (`spec.suspend: true`) и встаёт в очередь. Контроллер снимает паузу с Job в порядке создания
+(FIFO), когда работающих меньше лимита. Клиенты создают Job как обычно и о лимите ничего не знают: Job не отклоняется,
+а выполнится, как только освободится место. Namespace без `JobPool` оператор не трогает.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
-
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
-
-```sh
-make docker-build docker-push IMG=<some-registry>/jobpool-operator:tag
+```
+kubectl create job ──► mutating webhook ──► etcd ──► controller ──► suspend: false
+                       (suspend: true +              (FIFO, не больше
+                        label queued)                 maxConcurrentJobs)
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+- **Mutating webhook** на создание Job: если в namespace есть `JobPool`, ставит `suspend: true` и label
+  `jobpool.kiribu.dev/queued=true`. Ничего не считает, решение о запуске принимает только контроллер.
+- **Validating webhook** на создание `JobPool`: в одном namespace может быть только один `JobPool`.
+- **Контроллер** считает работающие Job, запускает следующие из очереди и пишет счётчики в `status`.
+  При удалении `JobPool` finalizer запускает всю очередь.
 
-**Install the CRDs into the cluster:**
+Почему устроено именно так — в [docs/design.md](docs/design.md).
+
+## Quickstart
+
+### Требования
+
+- Docker
+- [kind](https://kind.sigs.k8s.io/)
+- kubectl
+- Go 1.26+ (только для `make`-целей сборки и тестов)
+
+### Установка в kind
 
 ```sh
-make install
+# 1. Кластер
+kind create cluster --name jobpool
+
+# 2. cert-manager: выпускает TLS-сертификат для webhook-ов
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.21.1/cert-manager.yaml
+kubectl -n cert-manager wait --for=condition=Available deploy --all --timeout=180s
+
+# 3. Образ оператора: собрать и загрузить в kind
+make docker-build IMG=jobpool-operator:dev
+kind load docker-image jobpool-operator:dev --name jobpool
+
+# 4. CRD, RBAC, webhook-и и 2 реплики менеджера
+make deploy IMG=jobpool-operator:dev
+kubectl -n jobpool-operator-system rollout status deploy/jobpool-operator-controller-manager
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+Вместо шагов 3–4 можно поставить один собранный манифест: `make build-installer IMG=...` создаёт `dist/install.yaml`.
 
-```sh
-make deploy IMG=<some-registry>/jobpool-operator:tag
+### Использование
+
+```yaml
+# config/samples/scheduling_v1alpha1_jobpool.yaml
+apiVersion: scheduling.kiribu.dev/v1alpha1
+kind: JobPool
+metadata:
+  name: jobpool-sample
+spec:
+  maxConcurrentJobs: 2
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
 ```sh
-kubectl apply -k config/samples/
+kubectl create ns demo
+kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml
+
+# 5 Job, каждая спит 20 секунд
+for i in 1 2 3 4 5; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
+
+kubectl -n demo get jobpool        # короткое имя: jp
+# NAME             MAX   ACTIVE   QUEUED   READY   REASON   AGE
+# jobpool-sample   2     2        3        True    Active   10s
+
+kubectl -n demo get jobs -w        # Job запускаются по 2
+kubectl -n demo events --for jobpool/jobpool-sample
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+Пошаговый сценарий со всеми случаями и ожидаемым выводом — в [docs/e2e-guide.md](docs/e2e-guide.md).
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
+### Удаление
 
 ```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
+kubectl delete jobpools --all -A   # сначала пулы: finalizer запустит их очереди
 make undeploy
+kind delete cluster --name jobpool
 ```
 
-## Project Distribution
+Пулы нужно удалить **до** `make undeploy`, пока оператор работает. Иначе CRD не удалится: удаление будет ждать,
+пока с `JobPool` снимут finalizer, а снимать его будет некому.
 
-Following the options to release and provide this solution to the users.
+## Поведение и ограничения
 
-### By providing a bundle with all YAML files
+- **Очередь вместо отказа.** Job сверх лимита создаётся и ждёт на паузе, её не отклоняют.
+- **Работающие Job не останавливаются.** Если работающих Job уже больше лимита (например, их запустили до создания
+  `JobPool`), оператор их не трогает: пауза убила бы их поды. Он просто не запускает новые, пока работающих не станет
+  меньше лимита.
+- **Считаются все Job namespace,** в том числе созданные до `JobPool`. Завершённые (`Complete`/`Failed`) и стоящие на
+  паузе место не занимают.
+- **Чужие паузы не трогаются.** Если пользователь сам создал Job с `suspend: true`, она не встаёт в очередь, и оператор
+  её не запускает, даже при удалении `JobPool`.
+- **Job от CronJob и других контроллеров тоже встают в очередь:** webhook не различает, кто создал Job.
+- **Один `JobPool` на namespace.** Второй отклоняет webhook. Если два пула всё же проскочили одновременно, главным
+  считается самый старый, второй получает `Ready=False, reason=Duplicate`.
+- **Удаление `JobPool` запускает всю очередь,** а label `jobpool.kiribu.dev/enabled` снимается с namespace.
+- **Если оператор недоступен, Job в подключённых namespace не создаются** (`failurePolicy: Fail`). Иначе Job прошла бы
+  без паузы и сразу стартовала, а поставить её на паузу потом нельзя без убийства подов: лимит был бы нарушен. Чтобы
+  это не задело остальной кластер, webhook вызывается только для namespace с label `jobpool.kiribu.dev/enabled=true`.
+  Этот label контроллер ставит сам, когда в namespace появляется `JobPool`. Риск недоступности снижают 2 реплики
+  менеджера (webhook обслуживают обе), PodDisruptionBudget и `timeoutSeconds: 5`.
 
-1. Build the installer for the image built and published in the registry:
+## Разработка
 
 ```sh
-make build-installer IMG=<some-registry>/jobpool-operator:tag
+make test       # unit + envtest (контроллер и webhook-и)
+make lint       # golangci-lint
+make test-e2e   # kind-кластер jobpool-operator-test-e2e, деплой, 12 тестов, удаление кластера (~6 мин)
 ```
 
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
+`make deploy` и `make test-e2e` записывают тег образа в `config/manager/kustomization.yaml`; это изменение не коммитим.
 
-2. Using the installer
+## Структура
 
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/jobpool-operator/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+| Путь | Что там |
+|---|---|
+| `api/v1alpha1/` | Тип `JobPool`, имена label, finalizer и condition |
+| `internal/jobpool/` | Чистая логика без Kubernetes-клиента: что активно, FIFO, план запуска, главный пул |
+| `internal/webhook/v1/` | Mutating webhook для Job |
+| `internal/webhook/v1alpha1/` | Validating webhook для `JobPool` |
+| `internal/controller/` | Reconcile, finalizer, watch-и |
+| `config/` | Kustomize-манифесты: CRD, RBAC, webhook-и, cert-manager, Deployment, PDB, samples |
+| `test/e2e/` | E2E-тесты на kind |
+| `docs/` | Дизайн и ручной e2e-гайд |
 
 ## License
 
@@ -132,4 +149,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-
