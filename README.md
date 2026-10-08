@@ -28,10 +28,16 @@ kubectl create job ──► mutating webhook ──► etcd ──► controlle
 ### Требования
 
 - Docker
-- [kind](https://kind.sigs.k8s.io/), Kubernetes 1.30+ (нужны `matchConditions` у webhook и `preStop: sleep`;
-  проверено на 1.37)
+- [kind](https://kind.sigs.k8s.io/)
 - kubectl
 - Go 1.26+ (только для `make`-целей сборки и тестов)
+
+Версии:
+
+- **Проверено** (локально и в CI): kind v0.33.0, Kubernetes 1.37 (`kindest/node:v1.37.0`), cert-manager v1.21.1.
+- **Минимум для самого оператора** — Kubernetes 1.30: `matchConditions` у webhook и `preStop: sleep` (в 1.30–1.33
+  beta, включён по умолчанию). На других версиях подберите совместимый cert-manager по
+  [его таблице поддержки](https://cert-manager.io/docs/releases/); такие связки не проверялись.
 
 ### Установка в kind
 
@@ -73,7 +79,7 @@ spec:
 ```sh
 kubectl create ns demo
 kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml
-kubectl -n demo wait --for=condition=Ready jobpool/default   # с этого момента лимит действует
+kubectl -n demo wait --for=condition=Ready jobpool/default   # контроллер подключил namespace к webhook-у
 
 # 5 Job, каждая спит 20 секунд
 for i in 1 2 3 4 5; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
@@ -107,9 +113,10 @@ kind delete cluster --name jobpool
   меньше лимита.
 - **Считаются все Job namespace,** в том числе созданные до `JobPool`. Завершённые (`Complete`/`Failed`) и стоящие на
   паузе место не занимают.
-- **Лимит действует с момента `Ready=True`.** Webhook включается, когда контроллер ставит label на namespace. Job,
-  созданные раньше, считаются как Job, запущенные до `JobPool`. API server применяет label по своему кэшу Namespace,
-  поэтому возможно отставание на доли секунды.
+- **Лимит включается вместе с label на namespace.** `Ready=True` значит, что контроллер поставил label и подключил
+  namespace к webhook-у. API server применяет `namespaceSelector` по своему кэшу Namespace, который обновляется
+  асинхронно, обычно сразу; строгой границы этой задержки нет. Job, прошедшие до этого, считаются как Job,
+  запущенные до `JobPool`.
 - **Чужие паузы не трогаются.** Если пользователь сам создал Job с `suspend: true`, она не встаёт в очередь, и оператор
   её не запускает, даже при удалении `JobPool`.
 - **Снять паузу в обход очереди нельзя.** Если пользователь снимает паузу (`suspend: false`) со своей Job или с Job из

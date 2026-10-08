@@ -30,7 +30,8 @@ kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml   # nam
 kubectl -n demo wait --for=condition=Ready jobpool/default
 ```
 
-`Ready=True` значит, что контроллер подключил namespace к webhook-у, и лимит действует:
+`Ready=True` значит, что контроллер поставил label и подключил namespace к webhook-у. API server применяет label по
+своему кэшу Namespace, обычно сразу:
 
 ```sh
 kubectl get ns demo --show-labels

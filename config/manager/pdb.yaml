@@ -1,5 +1,6 @@
 # Keeps at least one replica (and its webhook server) running during voluntary
-# disruptions such as `kubectl drain`, so Job creation is never blocked.
+# disruptions such as `kubectl drain`. It does not cover a deleted pod or a lost
+# node: the second replica and the preStop pause reduce that risk.
 apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
