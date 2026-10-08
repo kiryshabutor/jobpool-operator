@@ -28,7 +28,8 @@ kubectl create job ──► mutating webhook ──► etcd ──► controlle
 ### Требования
 
 - Docker
-- [kind](https://kind.sigs.k8s.io/)
+- [kind](https://kind.sigs.k8s.io/), Kubernetes 1.30+ (нужны `matchConditions` у webhook и `preStop: sleep`;
+  проверено на 1.37)
 - kubectl
 - Go 1.26+ (только для `make`-целей сборки и тестов)
 
@@ -107,7 +108,8 @@ kind delete cluster --name jobpool
 - **Считаются все Job namespace,** в том числе созданные до `JobPool`. Завершённые (`Complete`/`Failed`) и стоящие на
   паузе место не занимают.
 - **Лимит действует с момента `Ready=True`.** Webhook включается, когда контроллер ставит label на namespace. Job,
-  созданные раньше, считаются как Job, запущенные до `JobPool`.
+  созданные раньше, считаются как Job, запущенные до `JobPool`. API server применяет label по своему кэшу Namespace,
+  поэтому возможно отставание на доли секунды.
 - **Чужие паузы не трогаются.** Если пользователь сам создал Job с `suspend: true`, она не встаёт в очередь, и оператор
   её не запускает, даже при удалении `JobPool`.
 - **Снять паузу в обход очереди нельзя.** Если пользователь снимает паузу (`suspend: false`) со своей Job или с Job из
@@ -126,12 +128,16 @@ kind delete cluster --name jobpool
   это не задело остальной кластер, webhook вызывается только для namespace с label `jobpool.kiribu.dev/enabled=true`.
   Этот label контроллер ставит сам, когда в namespace появляется `JobPool`. На UPDATE webhook вызывается только когда
   с Job снимают паузу (`matchConditions`), остальные изменения Job от оператора не зависят. Риск недоступности
-  снижают 2 реплики менеджера (webhook обслуживают обе), PodDisruptionBudget и `timeoutSeconds: 5`.
+  снижают 2 реплики менеджера (webhook обслуживают обе), PodDisruptionBudget, пауза `preStop` перед остановкой пода
+  и `timeoutSeconds: 5`.
 - **Лимит считает Job, а не поды.** Одна Job с большим `parallelism` может занять много ресурсов; ограничивать поды и
   ресурсы — задача `ResourceQuota` и `LimitRange`, они работают вместе с `JobPool`.
-- **Leader election не даёт fencing.** Если старый лидер зависнет дольше срока lease (15 с) посреди reconcile, а потом
-  отправит запоздавший запрос, на короткое время может работать на одну Job больше. Это общее ограничение
-  операторов на controller-runtime; подробнее в [docs/design.md](docs/design.md#известные-ограничения).
+- **Leader election не даёт fencing.** Если старый лидер зависнет дольше срока lease (15 с) между планом и запуском,
+  а потом отправит запоздавшие запросы, лимит может быть превышен на размер его устаревшего плана, пока лишние Job не
+  завершатся. Это общее ограничение операторов на controller-runtime; подробнее в
+  [docs/design.md](docs/design.md#известные-ограничения).
+- **Оператор работает под своей учёткой.** Снимать паузу с Job из очереди может только пользователь, под которым
+  работает оператор (в кластере — его ServiceAccount). При `make run` это пользователь из kubeconfig.
 
 ## Разработка
 
