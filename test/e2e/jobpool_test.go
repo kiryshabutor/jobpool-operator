@@ -41,7 +41,8 @@ import (
 const (
 	queuedLabel  = "jobpool.kiribu.dev/queued"
 	enabledLabel = "jobpool.kiribu.dev/enabled"
-	poolName     = "default"
+	poolAnnot    = "jobpool.kiribu.dev/pool"
+	poolName     = "limit"
 	managerName  = "jobpool-operator-controller-manager"
 	leaseName    = "b4772dc6.kiribu.dev"
 
@@ -119,13 +120,38 @@ func jobPoolScenarios() {
 	It("allows only one JobPool per namespace", func() {
 		ns := createNamespace("e2e-singleton")
 		createPool(ns, 1)
+		Expect(namespaceAnnotations(ns)).To(HaveKeyWithValue(poolAnnot, poolName))
 
 		err := tryCreatePool(ns, poolName, 1)
 		Expect(err).To(MatchError(ContainSubstring("already exists")))
 
 		err = tryCreatePool(ns, "second", 1)
-		Expect(err).To(MatchError(ContainSubstring(
-			"JobPool must be named 'default': only one JobPool per namespace is allowed")))
+		Expect(err).To(MatchError(ContainSubstring(fmt.Sprintf(
+			`JobPool %q already exists in namespace %q; only one JobPool per namespace is allowed`, poolName, ns))))
+	})
+
+	It("lets only one of concurrent JobPools in", func() {
+		ns := createNamespace("e2e-singleton-race")
+
+		const n = 5
+		errs := make([]error, n)
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Go(func() {
+				errs[i] = tryCreatePool(ns, fmt.Sprintf("pool-%d", i), 1)
+			})
+		}
+		wg.Wait()
+
+		created := ""
+		for i, err := range errs {
+			if err == nil {
+				Expect(created).To(BeEmpty(), "two JobPools were created")
+				created = fmt.Sprintf("pool-%d", i)
+			}
+		}
+		Expect(created).NotTo(BeEmpty())
+		Expect(namespaceAnnotations(ns)).To(HaveKeyWithValue(poolAnnot, created))
 	})
 
 	It("leaves a Job suspended by the user alone", func() {
@@ -179,7 +205,11 @@ func jobPoolScenarios() {
 				g.Expect(job.Spec.Suspend).NotTo(HaveValue(BeTrue()), "Job %s is still suspended", job.Name)
 			}
 			g.Expect(namespaceLabels(ns)).NotTo(HaveKey(enabledLabel))
+			g.Expect(namespaceAnnotations(ns)).NotTo(HaveKey(poolAnnot))
 		}).Should(Succeed())
+
+		// The namespace is free again: a JobPool with another name can be created at once.
+		Expect(tryCreatePool(ns, "next", 1)).To(Succeed())
 	})
 
 	It("keeps the queue and the limit when the leader fails over", func() {
@@ -237,6 +267,11 @@ func jobPoolScenarios() {
 
 		_, err = tryCreateJob(plain, 1, false)
 		Expect(err).NotTo(HaveOccurred(), "a namespace without a JobPool must not depend on the webhook")
+
+		// Without the webhook nobody can reserve a namespace, so no JobPool can be created.
+		err = tryCreatePool(plain, poolName, 1)
+		Expect(err).To(MatchError(ContainSubstring("vjobpool.kiribu.dev")),
+			"a JobPool was created without a reservation while the webhook was down")
 	})
 }
 
@@ -328,6 +363,12 @@ func namespaceLabels(ns string) map[string]string {
 	var namespace corev1.Namespace
 	getJSON(&namespace, "get", "ns", ns)
 	return namespace.Labels
+}
+
+func namespaceAnnotations(ns string) map[string]string {
+	var namespace corev1.Namespace
+	getJSON(&namespace, "get", "ns", ns)
+	return namespace.Annotations
 }
 
 // leaderPod returns the name of the manager pod holding the leader election lease.

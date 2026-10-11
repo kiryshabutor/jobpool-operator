@@ -37,6 +37,7 @@ import (
 
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 	"github.com/kiryl-b-inno/jobpool-operator/internal/jobpool"
+	"github.com/kiryl-b-inno/jobpool-operator/internal/reservation"
 )
 
 // JobPoolReconciler starts queued Jobs of a namespace without exceeding
@@ -60,10 +61,14 @@ type JobPoolReconciler struct {
 
 // Reconcile recomputes the queue of the namespace from scratch on every call,
 // so it does not matter which event triggered it (level-triggered).
-// The only allowed JobPool name is "default", so every request is <namespace>/default.
+// A request with an empty name stands for a namespace without a JobPool that still
+// has our traces (see poolRequests).
 func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
+	if req.Name == "" {
+		return ctrl.Result{}, r.cleanupNamespace(ctx, req.Namespace)
+	}
 	var pool schedulingv1alpha1.JobPool
 	if err := r.Get(ctx, req.NamespacedName, &pool); apierrors.IsNotFound(err) {
 		return ctrl.Result{}, r.cleanupNamespace(ctx, req.Namespace)
@@ -81,6 +86,10 @@ func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		if err := r.Patch(ctx, &pool, finalizerPatch(base)); err != nil {
 			return ctrl.Result{}, err
 		}
+	}
+
+	if owner, result, err := r.reserve(ctx, &pool); err != nil || !owner {
+		return result, err
 	}
 
 	if err := r.setNamespaceLabel(ctx, pool.Namespace, true); err != nil {
@@ -108,9 +117,59 @@ func (r *JobPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		metav1.ConditionTrue, schedulingv1alpha1.ReasonActive, "")
 }
 
-// finalize releases the queue of a deleted JobPool and removes its finalizer.
-// No new JobPool can appear meanwhile: it would have the same name as the one
-// being deleted, and the API server rejects it until the finalizer is gone.
+// reserve makes sure the namespace is reserved for the JobPool and reports whether
+// it is. Normally the JobPool webhook has reserved it before the JobPool was
+// stored, and the cached Namespace confirms that without an API call. The
+// controller reserves the namespace itself if the webhook was bypassed (webhooks
+// disabled, or a JobPool created before the webhook was installed).
+//
+// If the namespace is reserved for another JobPool, this one does nothing and
+// reports Conflict. It is reconciled again when the reservation changes (the
+// Namespace is watched), and in any case after a while: an owner that disappears
+// without its finalizer (removed by hand) leaves the Namespace unchanged, and only
+// a periodic check notices that its reservation is dead.
+func (r *JobPoolReconciler) reserve(ctx context.Context, pool *schedulingv1alpha1.JobPool) (bool, ctrl.Result, error) {
+	var ns corev1.Namespace
+	if err := r.Get(ctx, client.ObjectKey{Name: pool.Namespace}, &ns); err != nil {
+		// A missing namespace takes the JobPool with it.
+		return false, ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+	if owner, _ := reservation.Owner(&ns); owner == pool.Name {
+		return true, ctrl.Result{}, nil
+	}
+
+	d, err := reservation.Reserve(ctx, r.Client, r.APIReader, pool.Namespace, pool.Name, false)
+	if err != nil {
+		return false, ctrl.Result{}, err
+	}
+	if d.Verdict == reservation.Granted {
+		logf.FromContext(ctx).Info("Reserved namespace for JobPool", "previousOwner", d.Owner)
+		return true, ctrl.Result{}, nil
+	}
+
+	message := fmt.Sprintf("Namespace %s is reserved for JobPool %s; only one JobPool per namespace is allowed",
+		pool.Namespace, d.Owner)
+	if cond := meta.FindStatusCondition(pool.Status.Conditions, schedulingv1alpha1.ConditionReady); cond == nil ||
+		cond.Reason != schedulingv1alpha1.ReasonConflict {
+		r.Recorder.Eventf(pool, nil, corev1.EventTypeWarning, schedulingv1alpha1.ReasonConflict, "Reserve", "%s", message)
+	}
+	if err := r.updateStatus(ctx, pool, 0, 0, metav1.ConditionFalse, schedulingv1alpha1.ReasonConflict, message); err != nil {
+		return false, ctrl.Result{}, err
+	}
+	retryAfter := d.RetryAfter
+	if d.Verdict == reservation.Taken {
+		retryAfter = reservation.TTL
+	}
+	return false, ctrl.Result{RequeueAfter: retryAfter}, nil
+}
+
+// finalize releases the queue of a deleted JobPool, then the reservation of the
+// namespace, and removes its finalizer. No new JobPool can appear before the
+// reservation is released: the webhook rejects it while this one exists.
+//
+// A JobPool the namespace is not reserved for has nothing to release: it never
+// managed the queue (Conflict), or a previous call has already released the queue
+// and the reservation, and a new JobPool may have taken over the queue since.
 func (r *JobPoolReconciler) finalize(ctx context.Context, pool *schedulingv1alpha1.JobPool) (ctrl.Result, error) {
 	if !controllerutil.ContainsFinalizer(pool, schedulingv1alpha1.Finalizer) {
 		return ctrl.Result{}, nil
@@ -120,8 +179,17 @@ func (r *JobPoolReconciler) finalize(ctx context.Context, pool *schedulingv1alph
 		metav1.ConditionFalse, schedulingv1alpha1.ReasonTerminating, "JobPool is being deleted"); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.releaseNamespace(ctx, pool, pool.Namespace); err != nil {
+	var ns corev1.Namespace
+	if err := r.APIReader.Get(ctx, client.ObjectKey{Name: pool.Namespace}, &ns); client.IgnoreNotFound(err) != nil {
 		return ctrl.Result{}, err
+	}
+	if owner, _ := reservation.Owner(&ns); owner == pool.Name {
+		if err := r.releaseQueue(ctx, pool); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := reservation.Release(ctx, r.Client, r.APIReader, pool.Namespace, pool.Name); err != nil {
+			return ctrl.Result{}, err
+		}
 	}
 
 	base := pool.DeepCopy()
@@ -136,6 +204,23 @@ func finalizerPatch(base *schedulingv1alpha1.JobPool) client.Patch {
 	return client.MergeFromWithOptions(base, client.MergeFromWithOptimisticLock{})
 }
 
+// releaseQueue releases the queue of a JobPool being deleted, unless another JobPool
+// of the namespace waits to take it over (it got Conflict because the webhook was
+// bypassed): then the queue stays, and so does the limit.
+func (r *JobPoolReconciler) releaseQueue(ctx context.Context, pool *schedulingv1alpha1.JobPool) error {
+	var pools schedulingv1alpha1.JobPoolList
+	if err := r.APIReader.List(ctx, &pools, client.InNamespace(pool.Namespace)); err != nil {
+		return err
+	}
+	for _, other := range pools.Items {
+		if other.Name != pool.Name && other.DeletionTimestamp.IsZero() {
+			logf.FromContext(ctx).Info("Handed queue over to another JobPool", "successor", other.Name)
+			return nil
+		}
+	}
+	return r.releaseNamespace(ctx, pool, pool.Namespace)
+}
+
 // cleanupNamespace handles a namespace without a JobPool that still has our traces:
 // the enabled label, or queued Jobs. A Job can be queued after the finalizer has
 // released the queue: its admission request passed the webhook while the JobPool
@@ -144,13 +229,12 @@ func finalizerPatch(base *schedulingv1alpha1.JobPool) client.Patch {
 func (r *JobPoolReconciler) cleanupNamespace(ctx context.Context, namespace string) error {
 	// The cache may lag behind a JobPool created a moment ago. Its own create event
 	// will reconcile the namespace, so there is nothing to clean up.
-	var pool schedulingv1alpha1.JobPool
-	err := r.APIReader.Get(ctx, client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}, &pool)
-	if err == nil {
-		return nil
-	}
-	if !apierrors.IsNotFound(err) {
+	var pools schedulingv1alpha1.JobPoolList
+	if err := r.APIReader.List(ctx, &pools, client.InNamespace(namespace)); err != nil {
 		return err
+	}
+	if len(pools.Items) > 0 {
+		return nil
 	}
 	return r.releaseNamespace(ctx, nil, namespace)
 }
@@ -250,6 +334,7 @@ func (r *JobPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Any Job change (created, finished, deleted, user suspend) may free or take a slot.
 		Watches(&batchv1.Job{}, handler.EnqueueRequestsFromMapFunc(r.jobToPool)).
 		// The enabled label belongs to the controller: a manual change is reverted at once.
+		// A released or removed reservation lets a JobPool in Conflict take over.
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(r.namespaceToPool)).
 		Named("jobpool").
 		Complete(r)
@@ -259,29 +344,32 @@ func (r *JobPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 // A queued Job is mapped even without a JobPool: it must not stay queued forever.
 func (r *JobPoolReconciler) jobToPool(ctx context.Context, obj client.Object) []reconcile.Request {
 	queued := obj.GetLabels()[schedulingv1alpha1.QueuedLabel] == schedulingv1alpha1.LabelTrue
-	return r.poolRequest(ctx, obj.GetNamespace(), queued)
+	return r.poolRequests(ctx, obj.GetNamespace(), queued)
 }
 
 // namespaceToPool maps a Namespace to its JobPool.
 // A labelled namespace is mapped even without a JobPool: the label must be removed.
 func (r *JobPoolReconciler) namespaceToPool(ctx context.Context, obj client.Object) []reconcile.Request {
 	_, labelled := obj.GetLabels()[schedulingv1alpha1.EnabledNamespaceLabel]
-	return r.poolRequest(ctx, obj.GetName(), labelled)
+	return r.poolRequests(ctx, obj.GetName(), labelled)
 }
 
-// poolRequest returns the request for the JobPool of the namespace if it exists in
-// the cache, or if force is set. Without the check every Job of the cluster would
-// trigger a reconcile with API server reads.
-func (r *JobPoolReconciler) poolRequest(ctx context.Context, namespace string, force bool) []reconcile.Request {
-	key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
-	if !force {
-		err := r.Get(ctx, key, &schedulingv1alpha1.JobPool{})
-		if apierrors.IsNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			logf.FromContext(ctx).Error(err, "Failed to get JobPool", "namespace", namespace)
-		}
+// poolRequests returns requests for the JobPools of the namespace in the cache:
+// normally one, more only if the webhook was bypassed. Without a JobPool it returns
+// nothing, so that every Job of the cluster does not trigger a reconcile with API
+// server reads, unless force is set: then it returns a request with an empty name,
+// and the reconcile cleans the namespace up.
+func (r *JobPoolReconciler) poolRequests(ctx context.Context, namespace string, force bool) []reconcile.Request {
+	var pools schedulingv1alpha1.JobPoolList
+	if err := r.List(ctx, &pools, client.InNamespace(namespace)); err != nil {
+		logf.FromContext(ctx).Error(err, "Failed to list JobPools", "namespace", namespace)
 	}
-	return []reconcile.Request{{NamespacedName: key}}
+	requests := make([]reconcile.Request, 0, len(pools.Items))
+	for _, pool := range pools.Items {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(&pool)})
+	}
+	if len(requests) == 0 && force {
+		requests = append(requests, reconcile.Request{NamespacedName: client.ObjectKey{Namespace: namespace}})
+	}
+	return requests
 }

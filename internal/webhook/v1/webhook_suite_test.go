@@ -43,6 +43,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
+	webhookv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -131,6 +132,9 @@ var _ = BeforeSuite(func() {
 	Expect(err).NotTo(HaveOccurred())
 
 	err = SetupJobWebhookWithManager(mgr, operatorUser)
+	Expect(err).NotTo(HaveOccurred())
+	// The API server calls the JobPool webhook for every JobPool the tests create.
+	err = webhookv1alpha1.SetupJobPoolWebhookWithManager(mgr)
 	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:webhook

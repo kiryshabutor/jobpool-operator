@@ -23,7 +23,6 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	batchv1 "k8s.io/api/batch/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -63,7 +62,7 @@ type JobDefaulter struct {
 	// Cache is the manager's cache: the webhook is on the hot path of every Job
 	// creation and must answer fast.
 	Cache client.Reader
-	// APIReader reads the JobPool from the API server when the cache does not have it yet.
+	// APIReader reads JobPools from the API server when the cache does not have one yet.
 	APIReader client.Reader
 	// OperatorUser is the username the operator talks to the API server with.
 	OperatorUser string
@@ -99,11 +98,11 @@ func (d *JobDefaulter) Default(ctx context.Context, job *batchv1.Job) error {
 		return nil
 	}
 
-	pool, err := d.getPool(ctx, namespace)
+	active, err := d.hasActivePool(ctx, namespace)
 	if err != nil {
 		return err
 	}
-	if pool == nil || !pool.DeletionTimestamp.IsZero() {
+	if !active {
 		log.V(1).Info("No active JobPool in namespace, not queueing")
 		return nil
 	}
@@ -113,28 +112,36 @@ func (d *JobDefaulter) Default(ctx context.Context, job *batchv1.Job) error {
 	return nil
 }
 
-// getPool returns the JobPool of the namespace, or nil if there is none.
-// The cache is trusted only when it has a live JobPool. Otherwise this replica's
-// cache may lag behind, and the API server is asked:
+// hasActivePool reports whether the namespace has a JobPool that is not being deleted.
+// The cache is trusted only when it has one. Otherwise this replica's cache may lag
+// behind, and the API server is asked:
 //   - no JobPool in the cache: it may have been created a moment ago;
-//   - a JobPool being deleted: a new "default" may have replaced it already.
+//   - only a JobPool being deleted: a new one may have replaced it already.
 //
 // Both happen only while a JobPool is created or deleted, so the extra read is rare.
-func (d *JobDefaulter) getPool(ctx context.Context, namespace string) (*schedulingv1alpha1.JobPool, error) {
-	key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
-	var pool schedulingv1alpha1.JobPool
-	err := d.Cache.Get(ctx, key, &pool)
-	if apierrors.IsNotFound(err) || err == nil && !pool.DeletionTimestamp.IsZero() {
-		pool = schedulingv1alpha1.JobPool{}
-		err = d.APIReader.Get(ctx, key, &pool)
+func (d *JobDefaulter) hasActivePool(ctx context.Context, namespace string) (bool, error) {
+	var cached schedulingv1alpha1.JobPoolList
+	if err := d.Cache.List(ctx, &cached, client.InNamespace(namespace)); err != nil {
+		return false, err
 	}
-	if apierrors.IsNotFound(err) {
-		return nil, nil
+	if hasActive(cached.Items) {
+		return true, nil
 	}
-	if err != nil {
-		return nil, err
+	var stored schedulingv1alpha1.JobPoolList
+	if err := d.APIReader.List(ctx, &stored, client.InNamespace(namespace)); err != nil {
+		return false, err
 	}
-	return &pool, nil
+	return hasActive(stored.Items), nil
+}
+
+// hasActive reports whether any of the JobPools is not being deleted.
+func hasActive(pools []schedulingv1alpha1.JobPool) bool {
+	for i := range pools {
+		if pools[i].DeletionTimestamp.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 // requestNamespace returns the namespace the Job is created in. The object in an
