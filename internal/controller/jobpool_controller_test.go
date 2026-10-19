@@ -39,6 +39,8 @@ const (
 	interval = 100 * time.Millisecond
 	// settle is how long Consistently checks that the controller does NOT start a Job.
 	settle = 2 * time.Second
+	// poolName is the name of the JobPool most tests create.
+	poolName = "pool"
 )
 
 func newNamespace() string {
@@ -55,7 +57,7 @@ func newPool(namespace, name string, maxJobs int32) *schedulingv1alpha1.JobPool 
 }
 
 func createPool(namespace string, maxJobs int32) *schedulingv1alpha1.JobPool {
-	pool := newPool(namespace, schedulingv1alpha1.PoolName, maxJobs)
+	pool := newPool(namespace, poolName, maxJobs)
 	ExpectWithOffset(1, k8sClient.Create(ctx, pool)).To(Succeed())
 	return pool
 }
@@ -136,11 +138,15 @@ func markComplete(namespace, name string) {
 	}, timeout, interval).Should(Succeed())
 }
 
-// expectStatus waits for the counters of an active JobPool.
+// expectStatus waits for the counters of the active JobPool poolName.
 func expectStatus(namespace string, active, queued int32) {
-	EventuallyWithOffset(1, func(g Gomega) {
+	expectPoolStatus(namespace, poolName, active, queued)
+}
+
+func expectPoolStatus(namespace, name string, active, queued int32) {
+	EventuallyWithOffset(2, func(g Gomega) {
 		pool := &schedulingv1alpha1.JobPool{}
-		key := client.ObjectKey{Namespace: namespace, Name: schedulingv1alpha1.PoolName}
+		key := client.ObjectKey{Namespace: namespace, Name: name}
 		g.Expect(k8sClient.Get(ctx, key, pool)).To(Succeed())
 		g.Expect(pool.Status.ActiveJobs).To(Equal(active))
 		g.Expect(pool.Status.QueuedJobs).To(Equal(queued))
@@ -151,10 +157,49 @@ func expectStatus(namespace string, active, queued int32) {
 	}, timeout, interval).Should(Succeed())
 }
 
+// expectConflict waits until the JobPool reports that the namespace belongs to another one.
+func expectConflict(namespace, name string) {
+	EventuallyWithOffset(1, func(g Gomega) {
+		pool := &schedulingv1alpha1.JobPool{}
+		g.Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, pool)).To(Succeed())
+		cond := meta.FindStatusCondition(pool.Status.Conditions, schedulingv1alpha1.ConditionReady)
+		g.Expect(cond).NotTo(BeNil())
+		g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+		g.Expect(cond.Reason).To(Equal(schedulingv1alpha1.ReasonConflict))
+	}, timeout, interval).Should(Succeed())
+}
+
 func namespaceLabels(g Gomega, namespace string) map[string]string {
 	ns := &corev1.Namespace{}
 	g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
 	return ns.Labels
+}
+
+// owner returns the JobPool the namespace is reserved for.
+func owner(g Gomega, namespace string) string {
+	ns := &corev1.Namespace{}
+	g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
+	return ns.Annotations[schedulingv1alpha1.PoolAnnotation]
+}
+
+// setReservation writes the reservation annotations of the namespace, or removes
+// them if pool is "".
+func setReservation(namespace, pool string, reservedAt time.Time) {
+	EventuallyWithOffset(1, func(g Gomega) {
+		ns := &corev1.Namespace{}
+		g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: namespace}, ns)).To(Succeed())
+		if ns.Annotations == nil {
+			ns.Annotations = map[string]string{}
+		}
+		if pool == "" {
+			delete(ns.Annotations, schedulingv1alpha1.PoolAnnotation)
+			delete(ns.Annotations, schedulingv1alpha1.PoolReservedAtAnnotation)
+		} else {
+			ns.Annotations[schedulingv1alpha1.PoolAnnotation] = pool
+			ns.Annotations[schedulingv1alpha1.PoolReservedAtAnnotation] = reservedAt.UTC().Format(time.RFC3339)
+		}
+		g.Expect(k8sClient.Update(ctx, ns)).To(Succeed())
+	}, timeout, interval).Should(Succeed())
 }
 
 var _ = Describe("JobPool Controller", func() {
@@ -256,10 +301,12 @@ var _ = Describe("JobPool Controller", func() {
 		expectStatus(namespace, 3, 1)
 	})
 
-	It("labels the namespace and adds the finalizer", func() {
+	It("reserves and labels the namespace and adds the finalizer", func() {
 		pool := createPool(namespace, 1)
 
 		Eventually(func(g Gomega) {
+			// No webhook runs here, so the controller reserves the namespace itself.
+			g.Expect(owner(g, namespace)).To(Equal(poolName))
 			g.Expect(namespaceLabels(g, namespace)).To(
 				HaveKeyWithValue(schedulingv1alpha1.EnabledNamespaceLabel, schedulingv1alpha1.LabelTrue))
 			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
@@ -285,27 +332,19 @@ var _ = Describe("JobPool Controller", func() {
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names))
 			g.Expect(namespaceLabels(g, namespace)).NotTo(HaveKey(schedulingv1alpha1.EnabledNamespaceLabel))
+			g.Expect(owner(g, namespace)).To(BeEmpty(), "the reservation should be released")
 			g.Expect(getJob(g, namespace, "user-paused").Spec.Suspend).To(HaveValue(BeTrue()))
 		}, timeout, interval).Should(Succeed())
 	})
 
-	It("allows only a JobPool named default", func() {
-		err := k8sClient.Create(ctx, newPool(namespace, "other", 1))
-		Expect(apierrors.IsInvalid(err)).To(BeTrue(), "unexpected error: %v", err)
-		Expect(err).To(MatchError(ContainSubstring("only one JobPool per namespace is allowed")))
-
-		createPool(namespace, 1)
-		err = k8sClient.Create(ctx, newPool(namespace, schedulingv1alpha1.PoolName, 2))
-		Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "unexpected error: %v", err)
-	})
-
-	It("does not let a new JobPool appear while the old one releases its queue", func() {
+	It("keeps the reservation until the JobPool has released its queue", func() {
 		// A foreign finalizer keeps the deleted JobPool around after ours is removed.
 		const hold = "test.kiribu.dev/hold"
 		pool := createPool(namespace, 1)
 		names := createQueuedJobs(namespace, 2)
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(HaveLen(1))
+			g.Expect(owner(g, namespace)).To(Equal(poolName))
 		}, timeout, interval).Should(Succeed())
 		Eventually(func(g Gomega) {
 			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
@@ -315,10 +354,11 @@ var _ = Describe("JobPool Controller", func() {
 
 		Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
 
-		err := k8sClient.Create(ctx, newPool(namespace, schedulingv1alpha1.PoolName, 1))
-		Expect(apierrors.IsAlreadyExists(err)).To(BeTrue(), "unexpected error: %v", err)
 		Eventually(func(g Gomega) {
 			g.Expect(runningJobs(g, namespace, names)).To(Equal(names))
+			g.Expect(owner(g, namespace)).To(BeEmpty())
+			g.Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), pool)).To(Succeed())
+			g.Expect(pool.Finalizers).To(Equal([]string{hold}))
 		}, timeout, interval).Should(Succeed())
 
 		Eventually(func(g Gomega) {
@@ -326,6 +366,111 @@ var _ = Describe("JobPool Controller", func() {
 			controllerutil.RemoveFinalizer(pool, hold)
 			g.Expect(k8sClient.Update(ctx, pool)).To(Succeed())
 		}, timeout, interval).Should(Succeed())
+	})
+
+	// The webhook is not running in this suite, which is the case it guards against:
+	// the controller must stay correct even if a second JobPool slips past it.
+	Context("When the webhook was bypassed", func() {
+		It("leaves a second JobPool in Conflict and keeps the limit", func() {
+			createPool(namespace, 1)
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, timeout, interval).Should(Succeed())
+			Expect(k8sClient.Create(ctx, newPool(namespace, "second", 5))).To(Succeed())
+			names := createQueuedJobs(namespace, 3)
+
+			expectConflict(namespace, "second")
+			expectStatus(namespace, 1, 2)
+			Consistently(func(g Gomega) {
+				g.Expect(runningJobs(g, namespace, names)).To(HaveLen(1))
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, settle, interval).Should(Succeed())
+		})
+
+		It("hands the queue over to the second JobPool when the first is deleted", func() {
+			pool := createPool(namespace, 1)
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, timeout, interval).Should(Succeed())
+			Expect(k8sClient.Create(ctx, newPool(namespace, "second", 2))).To(Succeed())
+			expectConflict(namespace, "second")
+			names := createQueuedJobs(namespace, 4)
+			Eventually(func(g Gomega) {
+				g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:1]))
+			}, timeout, interval).Should(Succeed())
+
+			Expect(k8sClient.Delete(ctx, pool)).To(Succeed())
+
+			// The queue is not released: the second JobPool takes it over with its own limit.
+			expectPoolStatus(namespace, "second", 2, 2)
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal("second"))
+				g.Expect(namespaceLabels(g, namespace)).To(HaveKey(schedulingv1alpha1.EnabledNamespaceLabel))
+			}, timeout, interval).Should(Succeed())
+			Consistently(func(g Gomega) {
+				g.Expect(runningJobs(g, namespace, names)).To(Equal(names[:2]))
+			}, settle, interval).Should(Succeed())
+		})
+
+		It("keeps the owner's queue when a JobPool in Conflict is deleted", func() {
+			createPool(namespace, 1)
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, timeout, interval).Should(Succeed())
+			second := newPool(namespace, "second", 5)
+			Expect(k8sClient.Create(ctx, second)).To(Succeed())
+			expectConflict(namespace, "second")
+			names := createQueuedJobs(namespace, 3)
+			expectStatus(namespace, 1, 2)
+
+			Expect(k8sClient.Delete(ctx, second)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, client.ObjectKeyFromObject(second), &schedulingv1alpha1.JobPool{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue(), "JobPool second should be gone")
+			}, timeout, interval).Should(Succeed())
+			Consistently(func(g Gomega) {
+				g.Expect(runningJobs(g, namespace, names)).To(HaveLen(1))
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+				g.Expect(namespaceLabels(g, namespace)).To(HaveKey(schedulingv1alpha1.EnabledNamespaceLabel))
+			}, settle, interval).Should(Succeed())
+			expectStatus(namespace, 1, 2)
+		})
+
+		It("takes over a dead reservation of a JobPool that does not exist", func() {
+			setReservation(namespace, "ghost", time.Now().Add(-time.Hour))
+
+			createPool(namespace, 1)
+
+			expectStatus(namespace, 0, 0)
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, timeout, interval).Should(Succeed())
+		})
+
+		It("waits while the namespace is being reserved for another JobPool", func() {
+			setReservation(namespace, "ghost", time.Now())
+
+			createPool(namespace, 1)
+
+			expectConflict(namespace, poolName)
+			Consistently(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal("ghost"))
+			}, settle, interval).Should(Succeed())
+		})
+
+		It("restores the reservation when someone removes it", func() {
+			createPool(namespace, 1)
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, timeout, interval).Should(Succeed())
+
+			setReservation(namespace, "", time.Time{})
+
+			Eventually(func(g Gomega) {
+				g.Expect(owner(g, namespace)).To(Equal(poolName))
+			}, timeout, interval).Should(Succeed())
+		})
 	})
 
 	It("starts a Job queued after the JobPool is gone", func() {

@@ -27,8 +27,8 @@ COLS='NAME:.metadata.name,SUSPEND:.spec.suspend,QUEUED:.metadata.labels.jobpool\
 
 ```sh
 kubectl create ns demo
-kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml   # name: default, maxConcurrentJobs: 2
-kubectl -n demo wait --for=condition=Ready jobpool/default
+kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml   # name: limit, maxConcurrentJobs: 2
+kubectl -n demo wait --for=condition=Ready jobpool/limit
 ```
 
 `Ready=True` means the controller has set the label and connected the namespace to the webhook. The API server applies
@@ -47,7 +47,7 @@ for i in 1 2 3 4 5; do kubectl -n demo create -f config/samples/job_sleep.yaml; 
 
 kubectl -n demo get jp
 # NAME      MAX   ACTIVE   QUEUED   READY   REASON   AGE
-# default   2     2        3        True    Active   7s
+# limit     2     2        3        True    Active   7s
 
 kubectl -n demo get jobs -o custom-columns="$COLS"
 # NAME          SUSPEND   QUEUED   ACTIVE   DONE
@@ -64,14 +64,14 @@ when a Job finishes, the next one by creation time starts. After ~70 seconds all
 ```sh
 kubectl -n demo get jp
 # NAME      MAX   ACTIVE   QUEUED   READY   REASON   AGE
-# default   2     0        0        True    Active   87s
+# limit     2     0        0        True    Active   87s
 
-kubectl -n demo events --for jobpool/default
-# 84s   Normal   Started   JobPool/default   Started Job sleep-jdhck from queue
-# 84s   Normal   Started   JobPool/default   Started Job sleep-kp4jg from queue
-# 57s   Normal   Started   JobPool/default   Started Job sleep-5m55h from queue
-# 56s   Normal   Started   JobPool/default   Started Job sleep-jptg7 from queue
-# 34s   Normal   Started   JobPool/default   Started Job sleep-jrf5f from queue
+kubectl -n demo events --for jobpool/limit
+# 84s   Normal   Started   JobPool/limit     Started Job sleep-jdhck from queue
+# 84s   Normal   Started   JobPool/limit     Started Job sleep-kp4jg from queue
+# 57s   Normal   Started   JobPool/limit     Started Job sleep-5m55h from queue
+# 56s   Normal   Started   JobPool/limit     Started Job sleep-jptg7 from queue
+# 34s   Normal   Started   JobPool/limit     Started Job sleep-jrf5f from queue
 ```
 
 The first two Jobs went through the queue too: the webhook suspends **every** new Job, and only the controller decides
@@ -98,15 +98,17 @@ The namespace has no `enabled` label, so the API server does not even call the w
 
 ## 3. A second `JobPool` in a namespace is rejected
 
-A `JobPool` can only be named `default`, and the API server does not allow two objects with the same name in a
-namespace:
+The validating webhook reserved `demo` for the pool `limit` with an annotation on the Namespace:
 
 ```sh
-kubectl -n demo create -f config/samples/scheduling_v1alpha1_jobpool.yaml
-# Error from server (AlreadyExists): error when creating "config/samples/scheduling_v1alpha1_jobpool.yaml":
-# jobpools.scheduling.kiribu.dev "default" already exists
+kubectl get ns demo -o jsonpath='{.metadata.annotations}{"\n"}'
+# {"jobpool.kiribu.dev/pool":"limit","jobpool.kiribu.dev/pool-reserved-at":"2026-10-11T15:04:05Z"}
+```
 
-kubectl -n demo apply -f - <<'EOF'
+A pool with another name is rejected by the webhook:
+
+```sh
+kubectl -n demo create -f - <<'EOF'
 apiVersion: scheduling.kiribu.dev/v1alpha1
 kind: JobPool
 metadata:
@@ -114,12 +116,19 @@ metadata:
 spec:
   maxConcurrentJobs: 1
 EOF
-# The JobPool "second" is invalid: <nil>: Invalid value: JobPool must be named 'default': only one JobPool
-# per namespace is allowed
+# Error from server (Forbidden): error when creating "STDIN": admission webhook "vjobpool.kiribu.dev" denied the
+# request: JobPool "limit" already exists in namespace "demo"; only one JobPool per namespace is allowed
 ```
 
-`kubectl apply` of the same file with `name: default` does not create a second pool but updates the existing one: it
-is the same object.
+A second pool with the same name is rejected by the API server itself, as any duplicate name:
+
+```sh
+kubectl -n demo create -f config/samples/scheduling_v1alpha1_jobpool.yaml
+# Error from server (AlreadyExists): error when creating "config/samples/scheduling_v1alpha1_jobpool.yaml":
+# jobpools.scheduling.kiribu.dev "limit" already exists
+```
+
+`kubectl apply` of the same file does not create a second pool but updates the existing one: it is the same object.
 
 ## 4. A user's suspend is left alone
 
@@ -135,7 +144,7 @@ kubectl -n demo get job paused -o custom-columns="$COLS"
 
 kubectl -n demo get jp
 # NAME      MAX   ACTIVE   QUEUED   READY   REASON   AGE
-# default   2     0        0        True    Active   2m
+# limit     2     0        0        True    Active   2m
 ```
 
 A slot is free (`ACTIVE 0`), but the Job stays suspended: it is the user's suspend.
@@ -157,7 +166,7 @@ kubectl -n demo get job paused -o custom-columns="$COLS"
 
 kubectl -n demo get jp
 # NAME      MAX   ACTIVE   QUEUED   READY   REASON   AGE
-# default   2     2        1        True    Active   3m
+# limit     2     2        1        True    Active   3m
 ```
 
 The request succeeded without an error, but the Job did not start over the limit: it is queued. After ~20 seconds,
@@ -186,7 +195,7 @@ A few seconds later the lease belongs to the other replica, and the queue keeps 
 for i in 1 2 3; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
 kubectl -n demo get jobs -l jobpool.kiribu.dev/queued=true      # there are queued Jobs
 
-kubectl -n demo delete jobpool default
+kubectl -n demo delete jobpool limit
 
 kubectl -n demo get jobs -l jobpool.kiribu.dev/queued=true
 # No resources found in demo namespace.
@@ -196,14 +205,15 @@ kubectl get ns demo --show-labels
 # demo   Active   2m33s   kubernetes.io/metadata.name=demo
 ```
 
-The finalizer removed the label from the namespace and resumed every queued Job. New Jobs in `demo` are now created
-unsuspended.
+The finalizer removed the label from the namespace, resumed every queued Job and released the reservation: the
+`jobpool.kiribu.dev/pool` annotation is gone, and a `JobPool` with any name can be created in `demo` again. New Jobs in
+`demo` are now created unsuspended.
 
 ## 8. Operator unavailable: `failurePolicy: Fail`
 
 ```sh
 kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml
-kubectl -n demo wait --for=condition=Ready jobpool/default    # without this the webhook may not be connected yet
+kubectl -n demo wait --for=condition=Ready jobpool/limit    # without this the webhook may not be connected yet
 kubectl -n jobpool-operator-system scale deploy jobpool-operator-controller-manager --replicas=0
 kubectl -n jobpool-operator-system wait --for=delete pod -l control-plane=controller-manager --timeout=60s
 
@@ -216,10 +226,15 @@ kubectl -n demo create -f config/samples/job_sleep.yaml
 # namespace without a JobPool: works as usual
 kubectl -n plain create -f config/samples/job_sleep.yaml
 # job.batch/sleep-nbwbq created
+
+# but a new JobPool cannot be created anywhere: nobody can reserve the namespace
+kubectl -n plain create -f config/samples/scheduling_v1alpha1_jobpool.yaml
+# Error from server (InternalError): ... failed calling webhook "vjobpool.kiribu.dev": ... context deadline exceeded
 ```
 
 Without the operator a Job can neither be queued nor safely admitted: it would start over the limit. So creation is
-rejected, but only in namespaces where the admin enabled the limit. Bring the operator back:
+rejected, but only in namespaces where the admin enabled the limit. Creating a `JobPool`, a rare admin operation, waits
+for the operator as well. Bring the operator back:
 
 ```sh
 kubectl -n jobpool-operator-system scale deploy jobpool-operator-controller-manager --replicas=2
@@ -251,14 +266,18 @@ What it does:
      `startTime` and `completionTime`, not by polling), all 5 complete;
    - FIFO: Jobs start (`status.startTime`) in creation order;
    - namespace without a `JobPool`: Jobs start immediately, without the label;
-   - a second `default` is rejected (`AlreadyExists`), a pool with another name by the CEL rule;
+   - a second pool with another name is rejected by the webhook, with the same name by the API server
+     (`AlreadyExists`); the namespace carries the reservation annotation;
+   - five pools created concurrently in an empty namespace: exactly one passes;
    - a user's suspend holds for 20 seconds, the label does not appear;
    - a user's resume (of a queued Job and of their own): the Jobs go back into the queue, still 1 running;
-   - deleting the `JobPool`: the queue is empty, all Jobs started, the `enabled` label removed;
+   - deleting the `JobPool`: the queue is empty, all Jobs started, the `enabled` label and the reservation removed,
+     a pool with another name can be created at once;
    - leader failover with a non-empty queue: the new leader continues the queue, the peak is still 1, Jobs can be
      created while only one replica runs;
    - manager at `replicas=0`: a Job in a namespace with a pool is rejected, resuming is rejected too, while
-     `kubectl label job` succeeds (`matchConditions`); in a namespace without a pool the Job is created.
+     `kubectl label job` succeeds (`matchConditions`); in a namespace without a pool the Job is created, but a
+     `JobPool` is not (nobody can reserve the namespace).
 4. Deletes the cluster and its kubeconfig.
 
 After a failed run the cluster is kept for debugging; `make cleanup-test-e2e` deletes it.

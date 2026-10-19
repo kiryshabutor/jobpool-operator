@@ -2,7 +2,7 @@
 
 A Kubernetes operator that limits the number of **concurrently running Jobs** in a namespace.
 
-An admin creates a `JobPool` named `default` with a `maxConcurrentJobs` field in a namespace. From then on, every new
+An admin creates a `JobPool` with a `maxConcurrentJobs` field in a namespace. From then on, every new
 Job in that namespace is created **suspended** (`spec.suspend: true`) and enters a queue. The controller resumes Jobs
 in creation order (FIFO) while fewer than the limit are running. Clients create Jobs as usual and know nothing about
 the limit: a Job is never rejected, it runs as soon as a slot frees up. Namespaces without a `JobPool` are untouched.
@@ -16,8 +16,9 @@ kubectl create job ──► mutating webhook ──► etcd ──► controlle
 - **Mutating webhook** on Jobs: if the namespace has a `JobPool`, it sets `suspend: true` and the label
   `jobpool.kiribu.dev/queued=true` on a new Job, and on a Job that someone other than the operator resumes.
   It counts nothing; only the controller decides what starts.
-- **One `JobPool` per namespace:** the name can only be `default` (a CEL rule in the CRD), and the API server itself
-  does not allow two objects with the same name in a namespace.
+- **Validating webhook** on `JobPool`: one `JobPool` per namespace. It reserves the namespace for the first pool with
+  an annotation on the Namespace, written with an optimistic lock, so of two pools created at the same moment only
+  one passes.
 - **The controller** counts running Jobs, starts the next ones from the queue and writes counters to `status`.
   When a `JobPool` is deleted, a finalizer starts the whole queue.
 
@@ -83,7 +84,7 @@ KEEP_CLUSTER=1 hack/demo-up.sh   # keeps the cluster, only rebuilds and redeploy
 apiVersion: scheduling.kiribu.dev/v1alpha1
 kind: JobPool
 metadata:
-  name: default            # the only allowed name
+  name: limit              # any name; one JobPool per namespace
 spec:
   maxConcurrentJobs: 2
 ```
@@ -91,17 +92,17 @@ spec:
 ```sh
 kubectl create ns demo
 kubectl -n demo apply -f config/samples/scheduling_v1alpha1_jobpool.yaml
-kubectl -n demo wait --for=condition=Ready jobpool/default   # the controller connected the namespace to the webhook
+kubectl -n demo wait --for=condition=Ready jobpool/limit   # the controller connected the namespace to the webhook
 
 # 5 Jobs, each sleeps 20 seconds
 for i in 1 2 3 4 5; do kubectl -n demo create -f config/samples/job_sleep.yaml; done
 
 kubectl -n demo get jobpool        # short name: jp
-# NAME      MAX   ACTIVE   QUEUED   READY   REASON   AGE
-# default   2     2        3        True    Active   10s
+# NAME    MAX   ACTIVE   QUEUED   READY   REASON   AGE
+# limit   2     2        3        True    Active   10s
 
 kubectl -n demo get jobs -w        # Jobs run 2 at a time
-kubectl -n demo events --for jobpool/default
+kubectl -n demo events --for jobpool/limit
 ```
 
 A step-by-step walkthrough of all cases with expected output: [docs/e2e-guide.md](docs/e2e-guide.md).
@@ -135,9 +136,17 @@ deletion waits for the finalizer to be removed from each `JobPool`, and nobody i
   webhook puts it into the queue: the Job runs when a slot frees up. Only the operator itself may start queued Jobs
   (its user is detected at startup via `SelfSubjectReview`).
 - **Jobs from CronJobs and other controllers are queued too:** the webhook does not care who created the Job.
-- **One `JobPool` per namespace.** The name must be `default`: a `JobPool` with another name is rejected by the CRD's
-  CEL rule, a second `default` by the API server (`AlreadyExists`). A new `JobPool` also cannot be created while the
-  old one is still being deleted.
+- **One `JobPool` per namespace.** The name is up to you. A second `JobPool` is rejected by the validating webhook:
+  `JobPool "limit" already exists in namespace "demo"; only one JobPool per namespace is allowed`. The namespace is
+  reserved for its pool by the annotation `jobpool.kiribu.dev/pool`. The finalizer removes it right after releasing
+  the queue: until then a new `JobPool` cannot be created, after that it can, even if the old object is still visible
+  for a moment. If a `JobPool` somehow gets past the webhook (webhooks disabled, the annotation edited by hand), the
+  controller gives it `Ready=False, reason=Conflict` and it does nothing until the namespace is free; only one pool
+  ever manages the queue.
+- **Upgrading from the version with the fixed name `default`.** Existing pools keep working under their name. They
+  have no reservation yet: the controller adds it on its first reconcile after the upgrade, normally within seconds.
+  A second pool created in that window passes the webhook and takes the namespace, and the old pool reports
+  `Conflict`: the queue keeps a single limit, but it is the new pool's.
 - **Deleting a `JobPool` starts the whole queue,** and the `jobpool.kiribu.dev/enabled` label is removed from the
   namespace. A Job that entered the queue at the moment of deletion is started by the controller as well: it watches
   Jobs with the `queued` label in namespaces without a `JobPool`.
@@ -150,6 +159,7 @@ deletion waits for the finalizer to be removed from each `JobPool`, and nobody i
   appears in the namespace. On UPDATE the webhook is called only when a Job is being resumed (`matchConditions`); all
   other Job changes do not depend on the operator. The risk of unavailability is reduced by 2 manager replicas (both
   serve the webhook), a PodDisruptionBudget, a `preStop` pause before the pod stops, and `timeoutSeconds: 5`.
+  Creating a `JobPool` also needs the operator: without it nobody can reserve the namespace.
 - **The limit counts Jobs, not pods.** One Job with a large `parallelism` can use a lot of resources; limiting pods and
   resources is the job of `ResourceQuota` and `LimitRange`, which work alongside `JobPool`.
 - **Leader election provides no fencing.** If an old leader stalls longer than the lease duration (15 s) between
@@ -174,9 +184,11 @@ change.
 
 | Path | Contents |
 |---|---|
-| `api/v1alpha1/` | The `JobPool` type with the name CEL rule; label, finalizer and condition names |
+| `api/v1alpha1/` | The `JobPool` type; label, annotation, finalizer and condition names |
 | `internal/jobpool/` | Pure logic without a Kubernetes client: what is active, FIFO, start plan, resume detection |
+| `internal/reservation/` | One `JobPool` per namespace: the reservation rules and the Namespace patch with an optimistic lock |
 | `internal/webhook/v1/` | Mutating webhook for Jobs |
+| `internal/webhook/v1alpha1/` | Validating webhook for `JobPool` |
 | `internal/controller/` | Reconcile, finalizer, cleanup of namespaces without a `JobPool`, watches |
 | `config/` | Kustomize manifests: CRD, RBAC, webhook, cert-manager, Deployment, PDB, samples |
 | `test/e2e/` | E2E tests on kind |

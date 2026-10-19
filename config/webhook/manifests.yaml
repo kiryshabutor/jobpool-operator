@@ -25,3 +25,29 @@ webhooks:
     - jobs
   sideEffects: None
   timeoutSeconds: 5
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: validating-webhook-configuration
+webhooks:
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: webhook-service
+      namespace: system
+      path: /validate-scheduling-kiribu-dev-v1alpha1-jobpool
+  failurePolicy: Fail
+  name: vjobpool.kiribu.dev
+  rules:
+  - apiGroups:
+    - scheduling.kiribu.dev
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    resources:
+    - jobpools
+  sideEffects: NoneOnDryRun
+  timeoutSeconds: 5

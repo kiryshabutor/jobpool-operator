@@ -18,9 +18,6 @@ package v1alpha1
 
 // Names shared by the Job webhook and the JobPool controller.
 const (
-	// PoolName is the only allowed name of a JobPool (CEL rule in the CRD).
-	PoolName = "default"
-
 	// QueuedLabel marks a Job that was suspended by the webhook and waits in the queue.
 	// Suspended Jobs without this label belong to the user and are never started.
 	QueuedLabel = "jobpool.kiribu.dev/queued"
@@ -36,6 +33,17 @@ const (
 
 	// Finalizer releases the queue before a JobPool is deleted.
 	Finalizer = "jobpool.kiribu.dev/release-queue"
+
+	// PoolAnnotation on a Namespace reserves it for the JobPool with this name.
+	// Only one JobPool per namespace is allowed: the JobPool webhook sets the
+	// reservation with an optimistic lock on the Namespace, so of two concurrent
+	// JobPools only one gets it. The finalizer of the JobPool removes it.
+	PoolAnnotation = "jobpool.kiribu.dev/pool"
+
+	// PoolReservedAtAnnotation is the time (RFC 3339) PoolAnnotation was set. A
+	// reservation of a JobPool that does not exist is taken over only when it is
+	// old enough: the create request of that JobPool may still be in flight.
+	PoolReservedAtAnnotation = "jobpool.kiribu.dev/pool-reserved-at"
 )
 
 // Condition types and reasons of JobPool.
@@ -47,4 +55,7 @@ const (
 	ReasonActive = "Active"
 	// ReasonTerminating: the JobPool is being deleted and releases its queue.
 	ReasonTerminating = "Terminating"
+	// ReasonConflict: the namespace is reserved for another JobPool. Possible only
+	// if the JobPool webhook was bypassed; this JobPool does nothing.
+	ReasonConflict = "Conflict"
 )

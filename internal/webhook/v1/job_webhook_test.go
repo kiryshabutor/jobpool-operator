@@ -50,7 +50,7 @@ func newNamespace() string {
 
 func newPool(namespace string) *schedulingv1alpha1.JobPool {
 	pool := &schedulingv1alpha1.JobPool{
-		ObjectMeta: metav1.ObjectMeta{Name: schedulingv1alpha1.PoolName, Namespace: namespace},
+		ObjectMeta: metav1.ObjectMeta{Name: "pool", Namespace: namespace},
 		Spec:       schedulingv1alpha1.JobPoolSpec{MaxConcurrentJobs: 1},
 	}
 	Expect(k8sClient.Create(ctx, pool)).To(Succeed())
@@ -127,18 +127,19 @@ func (emptyCache) List(context.Context, client.ObjectList, ...client.ListOption)
 	return nil
 }
 
-// staleCache still has the previous JobPool "default", being deleted: the cache of
-// this replica has not seen that it is gone and a new one has replaced it.
+// staleCache still has only the previous JobPool, being deleted: the cache of this
+// replica has not seen that it is gone and a new one has replaced it.
 type staleCache struct{ emptyCache }
 
-func (staleCache) Get(_ context.Context, key client.ObjectKey, obj client.Object, _ ...client.GetOption) error {
-	*obj.(*schedulingv1alpha1.JobPool) = schedulingv1alpha1.JobPool{ObjectMeta: metav1.ObjectMeta{
-		Name:              key.Name,
-		Namespace:         key.Namespace,
-		UID:               "previous-pool",
+func (staleCache) List(_ context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	var listOpts client.ListOptions
+	listOpts.ApplyOptions(opts)
+	list.(*schedulingv1alpha1.JobPoolList).Items = []schedulingv1alpha1.JobPool{{ObjectMeta: metav1.ObjectMeta{
+		Name:              "previous",
+		Namespace:         listOpts.Namespace,
 		DeletionTimestamp: new(metav1.Now()),
 		Finalizers:        []string{schedulingv1alpha1.Finalizer},
-	}}
+	}}}
 	return nil
 }
 

@@ -43,6 +43,7 @@ import (
 	schedulingv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/api/v1alpha1"
 	"github.com/kiryl-b-inno/jobpool-operator/internal/controller"
 	webhookv1 "github.com/kiryl-b-inno/jobpool-operator/internal/webhook/v1"
+	webhookv1alpha1 "github.com/kiryl-b-inno/jobpool-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -209,6 +210,10 @@ func main() {
 		setupLog.Info("Only the operator may resume queued Jobs", "user", operatorUser)
 		if err := webhookv1.SetupJobWebhookWithManager(mgr, operatorUser); err != nil {
 			setupLog.Error(err, "Failed to create webhook", "webhook", "Job")
+			os.Exit(1)
+		}
+		if err := webhookv1alpha1.SetupJobPoolWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "JobPool")
 			os.Exit(1)
 		}
 	}

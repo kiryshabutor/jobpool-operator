@@ -13,11 +13,16 @@ Constraints:
 ## Overview
 
 ```
+kubectl create jobpool
+   → validating webhook vjobpool.kiribu.dev   namespace free? → reserve it (annotation on the Namespace)
+   → etcd
+   → JobPool controller                       finalizer, label enabled on the namespace
+
 kubectl create job
    → API server: authentication, RBAC
-   → mutating webhook mjob.kiribu.dev     JobPool in namespace? → suspend: true + label queued
+   → mutating webhook mjob.kiribu.dev         JobPool in namespace? → suspend: true + label queued
    → etcd
-   → JobPool controller                   active < max? → first queued ones: suspend: false, remove label
+   → JobPool controller                       active < max? → first queued ones: suspend: false, remove label
    → Kubernetes Job controller creates pods
 ```
 
@@ -58,8 +63,8 @@ the cache only if it holds a live pool. In two cases this replica's cache may la
 directly, once:
 
 - **the pool is not in the cache:** it may have been created a split second ago;
-- **the cache holds a pool with a `deletionTimestamp`:** the old `default` may already be gone and a new one (different
-  UID) created in its place. Trusting the cache would let the Job bypass the new pool's queue.
+- **the cache holds only a pool with a `deletionTimestamp`:** the old pool may already be gone and a new one created in
+  its place. Trusting the cache would let the Job bypass the new pool's queue.
 
 Both cases only happen while a pool is being created or deleted, and the webhook is called only for labelled
 namespaces (D14), so the extra request is rare. The opposite error is safe: if the cache still shows a live pool that
@@ -97,48 +102,111 @@ Without a finalizer, queued Jobs would stay suspended forever. Finalizer `jobpoo
 status Ready=False, reason=Terminating
 1. remove the enabled label from the namespace (the webhook is no longer called)
 2. resume all Jobs with the queued label
-3. remove the finalizer
+3. release the reservation of the namespace (D11)
+4. remove the finalizer
 ```
 
 The label goes first so that new Jobs stop being queued. But an admission request that passed the webhook before the
 label was removed may be persisted to etcd **after** step 2: such a Job ends up in a queue that no longer exists. A
 re-check a second later does not guarantee anything: in-flight requests have no known upper bound. So the controller
 watches Jobs with the `queued` label in namespaces **without** a `JobPool`: an event for such a Job triggers a
-reconcile of `<namespace>/default`, which finds no pool and releases the Job (D12). This works at any time, not only
-during deletion.
+reconcile of the namespace (a request with an empty name), which finds no pool and releases the Job (D12). This works
+at any time, not only during deletion.
 
-A new `JobPool` cannot appear while the old one is being deleted: it would have the same name (D11), and the API
-server does not create an object until the old one with that name is gone. So the finalizer does not check for a
-"successor".
+A new `JobPool` cannot appear while the old one is being deleted: the namespace stays reserved for the old one until
+step 3, and the webhook rejects any other pool until then (D11). The steps are idempotent: if the finalizer is
+interrupted after step 3, the retry sees that the reservation is no longer its own and only removes the finalizer. The
+queue is already released, and a new pool may have taken the namespace since: its queue must not be touched.
 
-### D11. One `JobPool` per namespace: the fixed name `default`
+### D11. One `JobPool` per namespace: validating webhook + reservation on the Namespace
 
-A `JobPool` can only be named `default`. This is a CEL rule in the CRD: `self.metadata.name == 'default'`. Names are
-unique within a namespace, and the API server itself rejects a second `default` (`AlreadyExists`), atomically, at the
-storage level.
+**History.** This is the third version, and the previous two are worth knowing:
 
-The first version used a validating webhook: `List` pools in the namespace → reject if one exists. Review showed this
-is not enough. The check and the write are not atomic: two concurrent CREATEs both see an empty namespace, and both
-are persisted. The controller compensated (the oldest one is primary, the second gets `Duplicate`), but the second
-object still existed, while the task says "there cannot be more than one". On top of that, the webhook admitted a new
-pool while the old one was being deleted, and the old one's finalizer could release the queue while the new limit was
-already in effect.
+1. **Validating webhook with `List`:** pools in the namespace → reject if one exists. The check and the write are not
+   atomic: two concurrent CREATEs both see an empty namespace, and both are persisted.
+2. **Fixed name `default`** (a CEL rule in the CRD, `self.metadata.name == 'default'`): the API server rejects a
+   second `default` atomically (`AlreadyExists`). Atomic, but the rule about *how many* pools is expressed through the
+   *name*. A meaningless name; a confusing error (`AlreadyExists` instead of "one pool per namespace"); and, most
+   importantly, a dead end for the API: several pools per namespace with Job selectors (`team=ml` → 2, `team=batch` →
+   10) cannot be added without a breaking change of the CRD, because every existing pool is called `default`.
+3. **Now:** the name is free, the rule lives in a validating webhook again, and atomicity comes from a reservation.
 
-The fixed name closes all of this without custom code: no validating webhook, no "primary pool" logic, no queue
-handover. The price is a meaningless name, but there is only one pool per namespace anyway. Other singleton objects
-in Kubernetes work the same way, for example the `default` ServiceAccount in every namespace.
+**The reservation.** The webhook on CREATE of a `JobPool` writes two annotations to the Namespace:
+
+```yaml
+jobpool.kiribu.dev/pool: <JobPool name>
+jobpool.kiribu.dev/pool-reserved-at: <RFC 3339 time>
+```
+
+The write is a patch with an optimistic lock (`resourceVersion`). Two concurrent CREATEs read the same Namespace
+version; the API server accepts only the first patch and answers the second with `Conflict`. The second webhook
+re-reads the Namespace, sees the reservation of the first pool and rejects its own. Every admitted CREATE writes to the
+Namespace (a new reservation or a renewed one, see below), so of two concurrent CREATEs only one can win: the
+compare-and-swap is done by etcd, as with the fixed name, but the key is now the Namespace instead of the pool name. The Namespace is the natural lock:
+there is exactly one per namespace, and the operator already owns a label on it (D14). An annotation rather than a
+label: nobody filters by it (cf. D6), and a `JobPool` name (up to 253 characters) does not always fit into a label value.
+
+The webhook's rules (`internal/reservation`, a pure function with unit tests):
+
+| Reservation on the Namespace | Decision |
+|---|---|
+| none | reserve for this pool, admit |
+| this pool's name | renew the time, admit (a retried CREATE) |
+| another pool, which exists (even being deleted) | reject: `JobPool "a" already exists in namespace "x"` |
+| another pool, which does not exist, younger than 1 min | reject: the namespace "is being reserved", retry later |
+| another pool, which does not exist, older than 1 min | take over: reserve for this pool, admit |
+
+**Why the TTL.** The webhook reserves the namespace *before* the pool is stored. After the webhook the request may
+still fail (another validating webhook, etcd), and the reservation is left dead. "The owner pool does not exist" is not
+enough to take it over: the owner's CREATE may still be in flight, a few milliseconds after the webhook. Both pools
+would then pass. A request ends within a minute (validating webhooks run in parallel with timeouts ≤ 30 s, the API
+server's `--request-timeout` is 60 s by default), so a reservation older than a minute without a pool is surely dead. The
+cost: after a failed CREATE another pool can be created in this namespace only a minute later (the same pool at once).
+The TTL has to stay above `--request-timeout`: a cluster with a larger value needs a larger TTL.
+
+**Why a retried CREATE renews the reservation.** Without the renewal the own-reservation case would write nothing, and
+the optimistic lock would not order it against another pool. Scenario: the CREATE of `a` failed after the webhook; a
+minute later `a` is created again and, at the same moment, `b`. The webhook of `a` sees its own reservation and admits
+`a` without a write; the webhook of `b` sees a dead reservation (no pool `a` yet, older than a minute) and takes it over
+with the unchanged `resourceVersion`. Both pools are stored. With the renewal the two webhooks race for the same
+`resourceVersion` again: if `a` renews first, `b` sees a fresh reservation and is rejected; if `b` takes over first, the
+renewal of `a` gets `Conflict`, and `a` sees a fresh reservation of `b` and is rejected.
+
+**Side effects.** The webhook writes to the Namespace, so it is registered with `sideEffects: NoneOnDryRun` and does not
+write anything on `--dry-run`: it only says whether the pool would be admitted.
+
+**Release.** The finalizer of the pool removes the reservation after releasing the queue (D10), only if the
+reservation is its own, with the same optimistic lock.
+
+**The controller as a second line of defence.** The webhook can be bypassed: webhooks disabled (`ENABLE_WEBHOOKS=false`),
+pools created before the webhook was installed, a reservation removed by hand. So the controller does not rely on it:
+
+- a pool whose namespace is free (or dead-reserved) gets the reservation from the controller itself; this also
+  restores a reservation removed by hand, since the Namespace is watched;
+- a pool whose namespace is reserved for another pool gets `Ready=False, reason=Conflict` and does nothing: the queue
+  is managed only by the owner. It checks the reservation again on every Namespace change and at least once a minute:
+  an owner removed past its finalizer (by hand) leaves the Namespace unchanged, and only the periodic check notices
+  that its reservation is dead;
+- when the owner is deleted while such a pool exists, the finalizer does not release the queue but hands it over: it
+  only releases the reservation, and the waiting pool takes the namespace with its own limit.
+
+**Extensibility.** Several pools per namespace with Job selectors would change one rule: "the namespace is taken"
+becomes "the new pool's selector overlaps an existing one". The API stays backwards compatible: a pool without a
+selector covers all Jobs, as now.
 
 ### D12. Reconcile is triggered by `Watches()` + map functions, not `Owns()`
 
 `Owns()` works through `ownerReferences`, and Jobs are created by others. Making the `JobPool` the owner of Jobs is not
-an option: when the pool is deleted, the garbage collector would delete all the Jobs. The pool name is known in
-advance (`default`), so every event maps to the key `<namespace>/default`:
+an option: when the pool is deleted, the garbage collector would delete all the Jobs. Every event maps to the pools of
+its namespace from the cache (normally one), or, when there is no pool but our traces have to be cleaned up, to a
+request for the namespace with an empty name:
 
 - `For(JobPool)`: creation, limit change, deletion;
 - `Watches(Job)`: new Job, completion, deletion, suspend change. The event is enqueued if the namespace has a pool
   (per the cache) **or** the Job has the `queued` label: such a Job must not stay suspended without a pool (D10);
-- `Watches(Namespace)`: someone changed the `enabled` label. The event is enqueued if the namespace has a pool or
-  carries our label: without a pool the label has to be removed.
+- `Watches(Namespace)`: someone changed the `enabled` label or the reservation. The event is enqueued if the namespace
+  has a pool or carries our label: without a pool the label has to be removed. A released reservation lets a pool in
+  `Conflict` take the namespace over (D11).
 
 The "is there a pool" check in the map function keeps Jobs across the whole cluster from triggering reconciles with
 requests to the API server.
@@ -180,6 +248,10 @@ controller sets the label when a `JobPool` appears in the namespace and removes 
 by the controller: manual changes are corrected immediately (D12). The `JobPool` check inside the webhook (D5) remains
 the second line of defence.
 
+The `JobPool` webhook has `failurePolicy: Fail` and no `namespaceSelector`: while the operator is down, no `JobPool`
+can be created anywhere. This is deliberate: without the webhook nobody reserves the namespace, and creating a pool is
+a rare admin operation that can wait. Jobs, the frequent operation, are affected only in namespaces with a pool.
+
 The webhook is also registered for UPDATE (D17), but `matchConditions` (CEL in the webhook configuration) lets only
 resumes through to it. All other Job changes (labels, finalizers from the garbage collector) do not depend on the
 operator and keep working when it is unavailable.
@@ -207,8 +279,10 @@ then `Fail` would hit the whole cluster.
 
 ### D16. Observability
 
-`status`: `activeJobs`, `queuedJobs`, `observedGeneration`, a `Ready` condition with reason `Active` / `Terminating`.
-`kubectl get jp` columns: Max, Active, Queued, Ready, Reason. A `Started` / `Released` event for every Job started.
+`status`: `activeJobs`, `queuedJobs`, `observedGeneration`, a `Ready` condition with reason `Active` / `Terminating` /
+`Conflict`. `kubectl get jp` columns: Max, Active, Queued, Ready, Reason. A `Started` / `Released` event for every Job
+started, a `Conflict` warning for a pool whose namespace belongs to another one. The owner of a namespace:
+`kubectl get ns x -o jsonpath='{.metadata.annotations.jobpool\.kiribu\.dev/pool}'`.
 
 ### D17. Resuming past the queue is not possible
 
@@ -241,7 +315,13 @@ acceptable for local development; in-cluster the operator has a dedicated Servic
 - **FIFO with one-second precision.** `creationTimestamp` has one-second precision; within a second, order is by name.
   The order is stable, but for Jobs with `generateName` within one second it does not match creation order.
 - **An unavailable operator blocks deletion of the `JobPool`** (finalizer) and of a namespace with a pool until the
-  operator is back. This is the usual cost of a finalizer.
+  operator is back. This is the usual cost of a finalizer. It also blocks the creation of new pools (D14).
+- **The reservation is an ordinary annotation.** Anyone allowed to `patch` the Namespace can change it. A removed
+  reservation is restored by the controller within moments, but in that window the webhook admits a new pool; if the
+  new pool reserves the namespace first, the old one reports `Conflict` and the new pool's limit applies. Writing
+  another pool's name into it has the same effect (D11). The limit itself holds: only one pool manages the queue.
+  Namespace `patch` is an admin permission, the same one needed to remove the `enabled` label.
+- **A dead reservation blocks other pools for up to a minute** after a failed CREATE (D11).
 
 ## Rejected alternatives
 
@@ -251,8 +331,12 @@ acceptable for local development; in-cluster the operator has a dedicated Servic
 | Suspend in reconcile | Race with the Job controller: pods may be created first (D3) |
 | Webhook with a counter | Concurrent requests exceed the limit (D4) |
 | ResourceQuota `count/jobs.batch` | Counts all Jobs, including finished ones, and rejects rather than queues |
-| CEL for "one pool per namespace" by content | CEL sees only the object itself, not its neighbours; so CEL checks the name (D11) |
-| Validating webhook for "one pool per namespace" | Check and write are not atomic: concurrent CREATEs both pass (D11) |
+| CEL for "one pool per namespace" by content | CEL sees only the object itself, not its neighbours (D11) |
+| Validating webhook that only lists pools | Check and write are not atomic: concurrent CREATEs both pass (D11) |
+| Fixed name `default` (CEL rule on the name) | Atomic, but the name means nothing and selectors per pool become a breaking change (D11) |
+| Separate lock object (e.g. a `Lease`) per namespace | One more object to create and clean up; the Namespace is already there and already ours (D11) |
+| Mutex in the webhook process | Both replicas serve the webhook (D15); a lock in memory does not span them |
+| Take over a reservation as soon as its pool is missing | The owner's CREATE may still be in flight; both pools would pass (D11) |
 | `Owns()` / `JobPool` owns Jobs | The Jobs are not ours; GC would delete them with the pool (D12) |
 | Count active Jobs by `status.active` | Lags right after start (D7) |
 | Read Jobs from the cache | A stale cache breaks the limit (D13) |
@@ -264,10 +348,18 @@ acceptable for local development; in-cluster the operator has a dedicated Servic
 ## Tests
 
 - `internal/jobpool`: table-driven unit tests of the pure logic (start plan, FIFO, resume detection), 100% coverage.
+- `internal/reservation`: table-driven unit tests of the reservation rules (D11); the API calls are covered by the
+  envtest suites below.
 - `internal/webhook/v1`: envtest, requests go through a real API server and admission chain. Covers CREATE, resume by
   a user and by the operator (the operator via impersonation), a cache miss and a terminating pool in the cache.
-- `internal/controller`: envtest with a running manager. There is no Job controller in envtest, so Job completion is
-  simulated via `status`. Regressions: the name CEL rule, a new pool while the old one is being deleted, a queued Job
-  without a pool, a manual change of the `enabled` label.
+- `internal/webhook/v1alpha1`: envtest for the `JobPool` webhook: a second pool, a pool being deleted, ten concurrent
+  CREATEs (exactly one passes; without the optimistic lock the test fails), a retried CREATE that renews an old
+  reservation, a retried CREATE racing another pool (without the renewal both pass), a fresh and a dead reservation,
+  dry run.
+- `internal/controller`: envtest with a running manager and no webhooks, which is the bypass case of D11. There is no
+  Job controller in envtest, so Job completion is simulated via `status`. Regressions: the reservation is kept until
+  the queue is released, a second pool gets `Conflict` and later takes the queue over, deleting a pool in `Conflict`
+  leaves the owner's queue alone, a dead and a fresh reservation, a removed reservation, a queued Job without a pool, a
+  manual change of the `enabled` label.
 - `test/e2e`: kind with real Jobs, pods, cert-manager, 2 replicas, leader failover. The scenarios are described in
   [e2e-guide.md](e2e-guide.md).
